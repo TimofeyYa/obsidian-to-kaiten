@@ -507,28 +507,41 @@ type CreatePayload struct {
 }
 
 // CreateGroupPayload — создание вложенной папки (document_group).
-// Согласно доке Kaiten /tree-entities POST.
+// Согласно доке Kaiten POST /document-groups (не /tree-entities!).
+// В ответ возвращается объект document group, у которого есть uid —
+// его и нужно использовать как parent_entity_uid для дочерних сущностей.
 type CreateGroupPayload struct {
 	Title           string  `json:"title"`
 	ParentEntityUID *string `json:"parent_entity_uid,omitempty"`
-	SortOrder       float64 `json:"sort_order"`
-	EntityType      string  `json:"entity_type"` // всегда "document_group"
+	SortOrder       float64 `json:"sort_order,omitempty"`
 }
+
+// pathDocumentGroups — POST /api/latest/document-groups (см. доку Kaiten).
+const pathDocumentGroups = "/document-groups"
 
 // CreateDocumentGroup — создаёт новую папку (document_group) внутри родителя.
 // Используется, чтобы отразить файловую иерархию Obsidian в Kaiten.
+//
+// ВАЖНО: ранее ошибочно дёргали POST /tree-entities — у этого эндпоинта в
+// публичном API Kaiten нет операции создания, он только GET. Папки
+// создаются через POST /document-groups, после чего автоматически
+// регистрируются в дереве (tree-entities).
 func (c *Client) CreateDocumentGroup(ctx context.Context, p CreateGroupPayload) (*TreeEntity, error) {
 	if p.SortOrder == 0 {
 		p.SortOrder = float64(time.Now().UnixNano()) / 1e9
 	}
-	p.EntityType = EntityTypeDocumentGroup
-	body, err := c.do(ctx, http.MethodPost, pathTreeEntities, p)
+	body, err := c.do(ctx, http.MethodPost, pathDocumentGroups, p)
 	if err != nil {
 		return nil, err
 	}
+	// Ответ — document_group object. Маппим в TreeEntity (поля uid, title,
+	// parent_entity_uid совпадают; entity_type принудительно проставим).
 	var t TreeEntity
 	if err := json.Unmarshal(body, &t); err != nil {
 		return nil, err
+	}
+	if t.EntityType == "" {
+		t.EntityType = EntityTypeDocumentGroup
 	}
 	return &t, nil
 }

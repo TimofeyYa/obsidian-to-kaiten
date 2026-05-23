@@ -331,3 +331,56 @@ func TestDocument_UnmarshalJSON_AcceptsStringID(t *testing.T) {
 		t.Errorf("не-числовой id не сохранён как UID: %+v", d4)
 	}
 }
+
+// Регрессия: создание document_group идёт на POST /document-groups,
+// а не на POST /tree-entities. Раньше эндпоинт был неверным и Kaiten
+// отвечал 400 "Treeentity should have required property 'source_entity_uid'".
+func TestCreateDocumentGroup_PostsToDocumentGroups(t *testing.T) {
+	var (
+		gotMethod string
+		gotPath   string
+		gotBody   map[string]any
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"uid":"grp-uid-1","title":"Notes","entity_type":"document_group","parent_entity_uid":"root-uid"}`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "t")
+
+	parent := "root-uid"
+	got, err := c.CreateDocumentGroup(context.Background(), CreateGroupPayload{
+		Title:           "Notes",
+		ParentEntityUID: &parent,
+	})
+	if err != nil {
+		t.Fatalf("CreateDocumentGroup: %v", err)
+	}
+
+	if gotMethod != http.MethodPost {
+		t.Errorf("method: %s, want POST", gotMethod)
+	}
+	if gotPath != "/api/latest/document-groups" {
+		t.Errorf("path: %s, want /api/latest/document-groups", gotPath)
+	}
+	if gotBody["title"] != "Notes" {
+		t.Errorf("title в теле: %v", gotBody["title"])
+	}
+	if gotBody["parent_entity_uid"] != "root-uid" {
+		t.Errorf("parent_entity_uid в теле: %v", gotBody["parent_entity_uid"])
+	}
+	// entity_type больше НЕ передаём (это поле document-groups не принимает).
+	if _, ok := gotBody["entity_type"]; ok {
+		t.Errorf("entity_type не должен передаваться в body: %v", gotBody["entity_type"])
+	}
+	if got.UID != "grp-uid-1" {
+		t.Errorf("UID из ответа потерян: %+v", got)
+	}
+	if got.EntityType != EntityTypeDocumentGroup {
+		t.Errorf("EntityType должен быть document_group, получили %q", got.EntityType)
+	}
+}
