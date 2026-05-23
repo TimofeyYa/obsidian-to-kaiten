@@ -331,6 +331,39 @@ type PatchPayload struct {
 	Type    string `json:"type,omitempty"`
 }
 
+// CreatePayload — полезная нагрузка для POST /documents.
+// Согласно доке Kaiten, sort_order обязателен.
+type CreatePayload struct {
+	Title           string  `json:"title"`
+	Content         string  `json:"content,omitempty"`
+	Type            string  `json:"type,omitempty"` // markdown / html
+	ParentEntityUID *string `json:"parent_entity_uid,omitempty"`
+	SortOrder       float64 `json:"sort_order"`
+}
+
+// CreateDocument — создаёт новый документ в указанной папке/пространстве.
+func (c *Client) CreateDocument(ctx context.Context, p CreatePayload) (*Document, error) {
+	if p.SortOrder == 0 {
+		p.SortOrder = float64(time.Now().Unix()) // иначе Kaiten отклонит (exclusiveMinimum: 0)
+	}
+	body, err := c.do(ctx, http.MethodPost, "/documents", p)
+	if err != nil {
+		return nil, err
+	}
+	var d Document
+	if err := json.Unmarshal(body, &d); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// DeleteDocument — удаляет документ по UID (согласно доке Kaiten:
+// DELETE /documents/{document_uid}). Если UID пуст — fallback на int ID.
+func (c *Client) DeleteDocument(ctx context.Context, idOrUID string) error {
+	_, err := c.do(ctx, http.MethodDelete, "/documents/"+idOrUID, nil)
+	return err
+}
+
 // PatchDocument — обновить документ. Возвращает обновлённую версию.
 func (c *Client) PatchDocument(ctx context.Context, id int, p PatchPayload) (*Document, error) {
 	body, err := c.do(ctx, http.MethodPatch, fmt.Sprintf(DocPath, id), p)
@@ -386,6 +419,59 @@ func (c *Client) ListTreeChildrenAll(ctx context.Context, parentUID string) ([]T
 		if len(page) < pageSize {
 			break
 		}
+	}
+	return out, nil
+}
+
+// FolderEntry — элемент плоского списка папок с полным путём.
+// FullPath — «Parent / Sub / Target» (разделитель — " / ").
+type FolderEntry struct {
+	UID      string
+	Title    string
+	FullPath string
+}
+
+// ListAllDocumentGroups — плоский список всех document_group (папок) в инстансе.
+// Обходит дерево рекурсивно от верхнего уровня (parent_entity_uid пуст),
+// но в вывод попадают ТОЛЬКО document_group — без spaces, документов и сторимапов.
+// archived папки пропускаются.
+func (c *Client) ListAllDocumentGroups(ctx context.Context) ([]FolderEntry, error) {
+	var out []FolderEntry
+	visited := map[string]bool{}
+
+	var walk func(parentUID, parentPath string) error
+	walk = func(parentUID, parentPath string) error {
+		children, err := c.ListTreeChildrenAll(ctx, parentUID)
+		if err != nil {
+			return err
+		}
+		for _, ch := range children {
+			if ch.Archived || visited[ch.UID] {
+				continue
+			}
+			visited[ch.UID] = true
+			fullPath := ch.Title
+			if parentPath != "" {
+				fullPath = parentPath + " / " + ch.Title
+			}
+			if ch.IsFolder() {
+				out = append(out, FolderEntry{
+					UID:      ch.UID,
+					Title:    ch.Title,
+					FullPath: fullPath,
+				})
+			}
+			// Рекурсия только в контейнеры (spaces и folders).
+			if ch.IsSpace() || ch.IsFolder() {
+				if err := walk(ch.UID, fullPath); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := walk("", ""); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

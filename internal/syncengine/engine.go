@@ -18,6 +18,10 @@ import (
 type Report struct {
 	Synced             int // Kaiten → Obsidian (документы)
 	Uploaded           int // Obsidian → Kaiten (документы)
+	Created            int // Новые документы созданы в Kaiten
+	DeletedRemote      int // Документы удалены в Kaiten
+	DeletedLocal       int // Локальные файлы удалены
+	Renamed            int // Переименования/перемещения в vault
 	Conflicts          int
 	NewLocal           int
 	Errors             int
@@ -28,8 +32,9 @@ type Report struct {
 }
 
 func (r Report) String() string {
-	return fmt.Sprintf("synced=%d uploaded=%d conflicts=%d new_local=%d errors=%d skipped=%d attach_down=%d attach_up=%d",
-		r.Synced, r.Uploaded, r.Conflicts, r.NewLocal, r.Errors, r.Skipped, r.AttachmentsDown, r.AttachmentsUp)
+	return fmt.Sprintf("synced=%d uploaded=%d created=%d deleted_remote=%d deleted_local=%d renamed=%d conflicts=%d new_local=%d errors=%d skipped=%d attach_down=%d attach_up=%d",
+		r.Synced, r.Uploaded, r.Created, r.DeletedRemote, r.DeletedLocal, r.Renamed,
+		r.Conflicts, r.NewLocal, r.Errors, r.Skipped, r.AttachmentsDown, r.AttachmentsUp)
 }
 
 // HasErrors возвращает true, если в отчёте есть ошибки.
@@ -40,10 +45,18 @@ func (r Report) HasErrors() bool { return r.Errors > 0 }
 type Engine struct {
 	Vault   string
 	BaseURL string
+	RootUID string // используется как parent_entity_uid при создании документов
 	Client  *kaiten.Client
 	State   *State
 	Logger  *slog.Logger
 	DryRun  bool
+
+	// CreateRemote — создавать в Kaiten документы, созданные локально в Obsidian (#5).
+	CreateRemote bool
+	// DeleteOrphans — удалять в Kaiten документы, исчезнувшие из vault (#4).
+	DeleteOrphans bool
+	// DeleteLocalOrphans — удалять локальные файлы для удалённых в Kaiten (#4).
+	DeleteLocalOrphans bool
 
 	// docRelHint — релативная директория в vault для текущего документа
 	// (вычисляется из иерархии tree-entities). Передаётся в targetRelPath.
@@ -160,13 +173,133 @@ func (e *Engine) Run(ctx context.Context, rootUID string) (rep Report, runErr er
 		}
 	}
 
-	// 7. Сохраняем state (НЕ в DryRun).
+	// 6b. DeleteOrphans (#4): для каждой записи state, которой нет ни в remotes,
+	// ни в locals — это файл, удалённый пользователем в Obsidian.
+	if e.DeleteOrphans {
+		remoteIDs := map[int]bool{}
+		for _, d := range full {
+			remoteIDs[d.ID] = true
+		}
+		localIDs := map[int]bool{}
+		for _, l := range locals {
+			localIDs[l.Frontmatter.KaitenID] = true
+		}
+		for key := range e.State.Documents {
+			id, _ := strconv.Atoi(key)
+			if localIDs[id] || !remoteIDs[id] {
+				continue
+			}
+			// Существует в Kaiten, но нет в vault — удаляем.
+			if err := ctx.Err(); err != nil {
+				return rep, err
+			}
+			if e.DryRun {
+				e.Logger.Info("would delete remote orphan", "id", id)
+				rep.DeletedRemote++
+				continue
+			}
+			// Ищем UID в remotes для правильного DELETE.
+			deleteKey := key
+			for _, doc := range full {
+				if doc.ID == id && doc.UID != "" {
+					deleteKey = doc.UID
+					break
+				}
+			}
+			if derr := e.Client.DeleteDocument(ctx, deleteKey); derr != nil {
+				e.Logger.Warn("не удалось удалить remote orphan", "id", id, "err", derr)
+				rep.Errors++
+				continue
+			}
+			delete(e.State.Documents, key)
+			rep.DeletedRemote++
+			e.Logger.Warn("удалён из Kaiten (файл удалён локально)", "id", id)
+		}
+	}
+
+	// 7. Обработка новых «голых» файлов (#5): пользователь создал .md в Obsidian.
+	if e.CreateRemote {
+		untracked, uerr := obsidian.WalkUntracked(e.Vault)
+		if uerr != nil {
+			e.Logger.Warn("поиск untracked-файлов", "err", uerr)
+		} else {
+			for _, abs := range untracked {
+				if err := ctx.Err(); err != nil {
+					return rep, err
+				}
+				if err := e.createFromUntracked(ctx, abs, &rep); err != nil {
+					e.Logger.Warn("не удалось создать в Kaiten", "path", abs, "err", err)
+					rep.Errors++
+				}
+			}
+		}
+	}
+
+	// 8. Сохраняем state (НЕ в DryRun).
 	if !e.DryRun {
 		if err := SaveState(e.Vault, e.State); err != nil {
 			return rep, fmt.Errorf("сохранение state: %w", err)
 		}
 	}
 	return rep, nil
+}
+
+// createFromUntracked — работает с .md файлом без kaiten_id: читаем сырой контент,
+// извлекаем title из имени файла, POST в Kaiten, и перезаписываем файл с frontmatter.
+func (e *Engine) createFromUntracked(ctx context.Context, abs string, rep *Report) error {
+	data, err := os.ReadFile(abs) //nolint:gosec
+	if err != nil {
+		return err
+	}
+	bodyStr := string(data)
+	// Проверяем на всякий случай: может быть битый frontmatter, не перезаписываем.
+	if strings.HasPrefix(strings.TrimSpace(bodyStr), "---") {
+		e.Logger.Debug("файл имеет frontmatter, но без kaiten_id — пропуск", "path", abs)
+		return nil
+	}
+	rel, _ := filepath.Rel(e.Vault, abs)
+	title := strings.TrimSuffix(filepath.Base(rel), ".md")
+	if e.DryRun {
+		e.Logger.Info("would create from untracked", "path", rel, "title", title)
+		rep.Created++
+		return nil
+	}
+	body := bodyStr
+	if e.resolver != nil {
+		body = e.resolver.ObsidianToKaiten(body)
+	}
+	var parent *string
+	if e.RootUID != "" {
+		root := e.RootUID
+		parent = &root
+	}
+	created, cerr := e.Client.CreateDocument(ctx, kaiten.CreatePayload{
+		Title:           title,
+		Content:         body,
+		Type:            "markdown",
+		ParentEntityUID: parent,
+	})
+	if cerr != nil {
+		return fmt.Errorf("create from untracked: %w", cerr)
+	}
+	// Пишем frontmatter в локальный файл.
+	fm := obsidian.Frontmatter{
+		KaitenID:  created.ID,
+		KaitenURL: fmt.Sprintf("%s/document/%d", strings.TrimRight(e.BaseURL, "/"), created.ID),
+		Updated:   created.Updated,
+	}
+	if err := obsidian.WriteAtomic(abs, fm, bodyStr, false); err != nil {
+		return err
+	}
+	e.State.Documents[strconv.Itoa(created.ID)] = DocState{
+		Path:          filepath.ToSlash(rel),
+		KaitenUpdated: created.Updated,
+		LocalMtime:    created.Updated,
+		ContentHash:   obsidian.HashBody(bodyStr),
+	}
+	rep.Created++
+	e.Logger.Info("created from untracked", "id", created.ID, "path", rel)
+	return nil
 }
 
 // buildFolderPaths — для каждой папки/пространства вычисляет относительный путь
@@ -230,25 +363,113 @@ func (e *Engine) apply(ctx context.Context, d Decision, rep *Report) error {
 		return e.handleConflict(d, idKey, rep)
 
 	case NewLocal:
-		// MVP: создание новых документов в Kaiten не поддерживаем — только логируем.
-		if d.Local != nil {
-			e.Logger.Info("локальный документ без удалённого аналога — пропуск",
-				"id", d.KaitenID, "path", d.Local.RelPath)
-		}
-		rep.NewLocal++
-		return nil
+		return e.handleNewLocal(ctx, d, idKey, rep)
 
 	case DeletedRemote:
-		if d.Local != nil {
-			e.Logger.Warn("документ удалён в Kaiten — локальная копия оставлена",
-				"id", d.KaitenID, "path", d.Local.RelPath)
-		}
+		return e.handleDeletedRemote(d, idKey, rep)
+	}
+	return nil
+}
+
+// handleNewLocal: локальный файл без удалённого аналога.
+// Если CreateRemote=true — создаём новый документ в Kaiten.
+// Примечание: файл в vault уже имеет во фронтматтере kaiten_id, но в Kaiten
+// такого ID нет. Это бывает, когда ранее созданный док был удалён, но state
+// не в курсе. Для полноценного создания из пустого файла нужен файл без kaiten_id —
+// такой в obsidian.Walk не попадает (там фильтр по kaiten_id). Поэтому отдельная
+// процедура CreateNewDocuments работает с файлами «без frontmatter» отдельно (см. Run).
+func (e *Engine) handleNewLocal(ctx context.Context, d Decision, idKey string, rep *Report) error {
+	if d.Local == nil {
+		rep.NewLocal++
+		return nil
+	}
+	if !e.CreateRemote {
+		e.Logger.Info("локальный файл без удалённого аналога (без --create-remote)",
+			"id", d.KaitenID, "path", d.Local.RelPath)
+		rep.NewLocal++
+		return nil
+	}
+	// Для этого case'а в frontmatter уже есть kaiten_id (иначе файл не попал бы в Walk).
+	// Предполагаем, что документ был удалён в Kaiten, но файл жив. Пересоздаём.
+	return e.createInKaiten(ctx, d.Local, idKey, rep)
+}
+
+// createInKaiten — POST /documents и обновление frontmatter локального файла с новым kaiten_id.
+func (e *Engine) createInKaiten(ctx context.Context, l *obsidian.File, oldIDKey string, rep *Report) error {
+	title := strings.TrimSuffix(filepath.Base(l.RelPath), ".md")
+	body := l.Body
+	if e.resolver != nil {
+		body = e.resolver.ObsidianToKaiten(body)
+	}
+	if e.DryRun {
+		e.Logger.Info("would create", "title", title, "path", l.RelPath)
+		rep.Created++
+		return nil
+	}
+	var parent *string
+	if e.RootUID != "" {
+		root := e.RootUID
+		parent = &root
+	}
+	created, err := e.Client.CreateDocument(ctx, kaiten.CreatePayload{
+		Title:           title,
+		Content:         body,
+		Type:            "markdown",
+		ParentEntityUID: parent,
+	})
+	if err != nil {
+		return fmt.Errorf("create document: %w", err)
+	}
+	// Обновляем frontmatter локального файла с новым ID.
+	l.Frontmatter.KaitenID = created.ID
+	l.Frontmatter.KaitenURL = fmt.Sprintf("%s/document/%d", strings.TrimRight(e.BaseURL, "/"), created.ID)
+	l.Frontmatter.Updated = created.Updated
+	if err := obsidian.WriteAtomic(l.AbsPath, l.Frontmatter, l.Body, false); err != nil {
+		return err
+	}
+	if oldIDKey != "0" {
+		delete(e.State.Documents, oldIDKey)
+	}
+	e.State.Documents[strconv.Itoa(created.ID)] = DocState{
+		Path:          l.RelPath,
+		KaitenUpdated: created.Updated,
+		LocalMtime:    created.Updated,
+		ContentHash:   obsidian.HashBody(l.Body),
+	}
+	rep.Created++
+	e.Logger.Info("created", "id", created.ID, "path", l.RelPath)
+	return nil
+}
+
+// handleDeletedRemote: документ пропал в Kaiten.
+// Если DeleteLocalOrphans=true — удаляем локальный файл.
+// Иначе оставляем (поведение по умолчанию из ТЗ: «локальная версия оставлена»).
+func (e *Engine) handleDeletedRemote(d Decision, idKey string, rep *Report) error {
+	if d.Local == nil {
+		delete(e.State.Documents, idKey)
+		rep.Skipped++
+		return nil
+	}
+	if !e.DeleteLocalOrphans {
+		e.Logger.Warn("документ удалён в Kaiten — локальная копия оставлена",
+			"id", d.KaitenID, "path", d.Local.RelPath)
 		if !e.DryRun {
 			delete(e.State.Documents, idKey)
 		}
 		rep.Skipped++
 		return nil
 	}
+	if e.DryRun {
+		e.Logger.Info("would delete local orphan", "path", d.Local.RelPath)
+		rep.DeletedLocal++
+		return nil
+	}
+	if err := os.Remove(d.Local.AbsPath); err != nil {
+		return fmt.Errorf("delete local orphan: %w", err)
+	}
+	delete(e.State.Documents, idKey)
+	rep.DeletedLocal++
+	e.Logger.Warn("локальный осиротевший файл удалён", "path", d.Local.RelPath)
 	return nil
 }
 
@@ -273,7 +494,31 @@ func (e *Engine) pullRemote(d Decision, idKey string, rep *Report) error {
 		body = e.resolver.KaitenToObsidian(body)
 	}
 
-	relPath := e.targetRelPath(r, d.Local)
+	// Вычисляем желаемый путь НЕЗАВИСИМО от текущего расположения локального файла,
+	// чтобы поддержать переименования/перемещения в Kaiten (#7, #8).
+	desiredRel := e.targetRelPath(r, nil)
+	relPath := desiredRel
+
+	// Если в vault уже есть файл с этим kaiten_id, но по другому пути — переименование.
+	if d.Local != nil && d.Local.RelPath != desiredRel && !e.DryRun {
+		oldAbs := d.Local.AbsPath
+		newAbs, sjErr := SafeJoin(e.Vault, desiredRel)
+		if sjErr != nil {
+			return fmt.Errorf("небезопасный путь при переименовании: %w", sjErr)
+		}
+		if err := os.MkdirAll(filepath.Dir(newAbs), 0o755); err != nil {
+			return fmt.Errorf("mkdir для переименования: %w", err)
+		}
+		if err := os.Rename(oldAbs, newAbs); err != nil {
+			e.Logger.Warn("не удалось переименовать", "old", oldAbs, "new", newAbs, "err", err)
+		} else {
+			rep.Renamed++
+			e.Logger.Info("renamed", "from", d.Local.RelPath, "to", desiredRel)
+			// Обновляем ссылку на File (для последующего WriteAtomic).
+			d.Local.AbsPath = newAbs
+			d.Local.RelPath = desiredRel
+		}
+	}
 
 	// Валидация пути (риск R-04 — path traversal).
 	abs, err := SafeJoin(e.Vault, relPath)

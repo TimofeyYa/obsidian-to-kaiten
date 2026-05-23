@@ -220,3 +220,66 @@ func TestListSpaces_ParsesStringParentEntityUID(t *testing.T) {
 		t.Errorf("null должен дать nil-указатель, получено %v", spaces[0].ParentEntityUID)
 	}
 }
+
+// ListAllDocumentGroups собирает только document_group, рекурсивно,
+// игнорируя spaces, documents и archived.
+func TestListAllDocumentGroups(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/latest/tree-entities" {
+			http.NotFound(w, r)
+			return
+		}
+		parent := r.URL.Query().Get("parent_entity_uid")
+		root := ""
+		spaceUID := "space-1"
+		folderTop := "folder-top"
+		folderSub := "folder-sub"
+		switch parent {
+		case root:
+			// Верхний уровень: один space.
+			_, _ = w.Write([]byte(`[
+				{"uid":"space-1","title":"Marketing","entity_type":"space"}
+			]`))
+		case spaceUID:
+			// Внутри space: одна папка и один документ.
+			_, _ = w.Write([]byte(`[
+				{"uid":"folder-top","title":"Docs","entity_type":"document_group","parent_entity_uid":"space-1"},
+				{"uid":"doc-1","id":1,"title":"X","entity_type":"document","parent_entity_uid":"space-1"}
+			]`))
+		case folderTop:
+			// Внутри папки: вложенная папка + archived папка (должна быть пропущена).
+			_, _ = w.Write([]byte(`[
+				{"uid":"folder-sub","title":"Drafts","entity_type":"document_group","parent_entity_uid":"folder-top"},
+				{"uid":"folder-arch","title":"Old","entity_type":"document_group","parent_entity_uid":"folder-top","archived":true}
+			]`))
+		case folderSub:
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "tok")
+	c.SetRateLimit(1000)
+	folders, err := c.ListAllDocumentGroups(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(folders) != 2 {
+		t.Fatalf("ожидалось 2 папки (Docs, Drafts), получено %d: %+v", len(folders), folders)
+	}
+	// Проверяем full path: Drafts должен быть "Marketing / Docs / Drafts".
+	var drafts *FolderEntry
+	for i := range folders {
+		if folders[i].UID == "folder-sub" {
+			drafts = &folders[i]
+		}
+	}
+	if drafts == nil {
+		t.Fatal("папка Drafts не найдена")
+	}
+	if !strings.Contains(drafts.FullPath, "Marketing / Docs / Drafts") {
+		t.Errorf("неверный full path: %q", drafts.FullPath)
+	}
+}

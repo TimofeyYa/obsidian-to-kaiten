@@ -59,6 +59,45 @@ func IsHiddenPath(rel string) bool {
 	return false
 }
 
+// WalkUntracked — все .md файлы без валидного kaiten_id во фронтматтере.
+// Полезно для --create-remote: пользователь создал файл в Obsidian, хочет вылить в Kaiten.
+// Пропускает файлы в kaiten_files/ и скрытые пути.
+func WalkUntracked(vault string) ([]string, error) {
+	var out []string
+	err := filepath.WalkDir(vault, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(vault, path)
+		if rel == "." {
+			return nil
+		}
+		if IsHiddenPath(rel) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// Пропускаем папку вложений — там не должно быть «голых» документов.
+		if d.IsDir() && (rel == "kaiten_files" || strings.HasPrefix(rel, "kaiten_files"+string(filepath.Separator))) {
+			return filepath.SkipDir
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !strings.EqualFold(filepath.Ext(path), ".md") {
+			return nil
+		}
+		// Проверяем, что файл НЕ имеет валидного frontmatter с kaiten_id.
+		if _, ferr := ReadFile(vault, path); ferr == nil {
+			return nil // уже трэкируется, не наш клиент
+		}
+		out = append(out, path)
+		return nil
+	})
+	return out, err
+}
+
 // Walk обходит vault и возвращает все .md файлы, у которых ни одна часть
 // относительного пути не начинается с точки.
 func Walk(vault string) ([]File, error) {
