@@ -1,0 +1,26 @@
+# Бинарники
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Артефакты тестов и покрытия
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Локальные данные синка (никогда не должны попадать в репо)
+.kaiten-sync/
+*.tmp
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Локальные конфиги пользователя
+config.yaml
+*.local.yaml

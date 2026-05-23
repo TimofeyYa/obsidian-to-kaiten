@@ -1,0 +1,79 @@
+# Конфигурация golangci-lint для kaiten-obsidian-sync.
+# Запуск: golangci-lint run
+# Версия golangci-lint: 1.59+
+
+run:
+  timeout: 3m
+  tests: true
+  go: "1.22"
+
+linters:
+  disable-all: true
+  enable:
+    # Базовые (включены в дефолте — оставляем явно)
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+    # Дополнительные
+    - bodyclose       # проверяет закрытие resp.Body
+    - errorlint       # корректное использование %w и errors.Is/As
+    - gocritic        # дополнительные проверки стиля
+    - gofmt
+    - goimports
+    - gosec           # security
+    - misspell        # опечатки
+    - nakedret        # naked return в больших функциях
+    - prealloc        # предложения по prealloc слайсов
+    - revive          # замена golint
+    - unconvert       # лишние type-конверсии
+    - unparam         # неиспользуемые параметры
+
+linters-settings:
+  errcheck:
+    # Игнорируем игнорирование возврата у Close/Flush/Write/Chtimes.
+    exclude-functions:
+      - (io.Closer).Close
+      - os.Chtimes
+      - (*os.File).Close
+  gosec:
+    excludes:
+      # G304: чтение файла по пути из переменной — для CLI-утилиты это норма.
+      - G304
+      # G306: 0o644 для md-файлов — приемлемо.
+      - G306
+  revive:
+    rules:
+      - name: var-naming
+      - name: indent-error-flow
+      - name: context-as-argument
+      - name: error-return
+      - name: error-naming
+      - name: package-comments
+      - name: unused-parameter
+        disabled: true
+  gocritic:
+    disabled-checks:
+      - ifElseChain
+      - singleCaseSwitch
+  misspell:
+    locale: US
+
+issues:
+  exclude-rules:
+    # В тестах допускаем длинные функции и magic numbers.
+    - path: _test\.go
+      linters:
+        - gosec
+        - errcheck
+        - gocritic
+        - prealloc
+        - unparam
+    # cmd/sync/main.go использует os.Exit — это нормально.
+    - path: cmd/sync/main\.go
+      linters:
+        - revive
+  max-issues-per-linter: 0
+  max-same-issues: 0
