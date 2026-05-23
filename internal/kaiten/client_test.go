@@ -223,37 +223,41 @@ func TestListSpaces_ParsesStringParentEntityUID(t *testing.T) {
 
 // ListAllDocumentGroups собирает только document_group, рекурсивно,
 // игнорируя spaces, documents и archived.
+//
+// Обратите внимание: верхний уровень получается запросом БЕЗ parent_entity_uid
+// (реальный Kaiten отвечает верхний уровень дерева), и эта папка может иметь
+// parent_entity_uid: null.
 func TestListAllDocumentGroups(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/latest/tree-entities" {
 			http.NotFound(w, r)
 			return
 		}
-		parent := r.URL.Query().Get("parent_entity_uid")
-		root := ""
-		spaceUID := "space-1"
-		folderTop := "folder-top"
-		folderSub := "folder-sub"
-		switch parent {
-		case root:
-			// Верхний уровень: один space.
+		// Реальный Kaiten: без параметра — верхний уровень дерева.
+		params := r.URL.Query()
+		hasParent := params.Has("parent_entity_uid")
+		parent := params.Get("parent_entity_uid")
+
+		switch {
+		case !hasParent:
+			// Верхний уровень: space + топ-левел document_group с null parent
+			// (как в реальном инстансе пользователя).
 			_, _ = w.Write([]byte(`[
-				{"uid":"space-1","title":"Marketing","entity_type":"space"}
+				{"uid":"space-1","title":"Marketing","entity_type":"space"},
+				{"uid":"folder-root","title":"Personal Notes","entity_type":"document_group","parent_entity_uid":null}
 			]`))
-		case spaceUID:
+		case parent == "space-1":
 			// Внутри space: одна папка и один документ.
 			_, _ = w.Write([]byte(`[
 				{"uid":"folder-top","title":"Docs","entity_type":"document_group","parent_entity_uid":"space-1"},
 				{"uid":"doc-1","id":1,"title":"X","entity_type":"document","parent_entity_uid":"space-1"}
 			]`))
-		case folderTop:
-			// Внутри папки: вложенная папка + archived папка (должна быть пропущена).
+		case parent == "folder-top":
+			// Внутри папки: вложенная + archived (пропускается).
 			_, _ = w.Write([]byte(`[
 				{"uid":"folder-sub","title":"Drafts","entity_type":"document_group","parent_entity_uid":"folder-top"},
 				{"uid":"folder-arch","title":"Old","entity_type":"document_group","parent_entity_uid":"folder-top","archived":true}
 			]`))
-		case folderSub:
-			_, _ = w.Write([]byte(`[]`))
 		default:
 			_, _ = w.Write([]byte(`[]`))
 		}
@@ -266,20 +270,23 @@ func TestListAllDocumentGroups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(folders) != 2 {
-		t.Fatalf("ожидалось 2 папки (Docs, Drafts), получено %d: %+v", len(folders), folders)
+	// Ожидаем 3 папки: Personal Notes (топ-левел), Docs, Drafts.
+	if len(folders) != 3 {
+		t.Fatalf("ожидалось 3 папки, получено %d: %+v", len(folders), folders)
 	}
-	// Проверяем full path: Drafts должен быть "Marketing / Docs / Drafts".
-	var drafts *FolderEntry
+	var topLevel, drafts *FolderEntry
 	for i := range folders {
-		if folders[i].UID == "folder-sub" {
+		switch folders[i].UID {
+		case "folder-root":
+			topLevel = &folders[i]
+		case "folder-sub":
 			drafts = &folders[i]
 		}
 	}
-	if drafts == nil {
-		t.Fatal("папка Drafts не найдена")
+	if topLevel == nil || topLevel.FullPath != "Personal Notes" {
+		t.Errorf("top-level папка не найдена или путь неверный: %+v", topLevel)
 	}
-	if !strings.Contains(drafts.FullPath, "Marketing / Docs / Drafts") {
-		t.Errorf("неверный full path: %q", drafts.FullPath)
+	if drafts == nil || !strings.Contains(drafts.FullPath, "Marketing / Docs / Drafts") {
+		t.Errorf("вложенный path неверен: %+v", drafts)
 	}
 }

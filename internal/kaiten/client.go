@@ -431,21 +431,28 @@ type FolderEntry struct {
 	FullPath string
 }
 
-// ListAllDocumentGroups — плоский список всех document_group (папок) в инстансе.
-// Обходит дерево рекурсивно от верхнего уровня (parent_entity_uid пуст),
-// но в вывод попадают ТОЛЬКО document_group — без spaces, документов и сторимапов.
-// archived папки пропускаются.
+// ListAllDocumentGroups — плоский список всех папок (document_group) в инстансе.
+//
+// Подход:
+//  1. Один вызов GET /tree-entities без параметров — возвращает
+//     верхний уровень дерева (все сущности без parent_entity_uid).
+//  2. Добор вложенных папок: рекурсивно входим внутрь каждой
+//     space/document_group, но СОБИРАЕМ ТОЛЬКО document_group.
+//
+// archived папки пропускаются. Путь формируется «Parent / Sub / Target».
 func (c *Client) ListAllDocumentGroups(ctx context.Context) ([]FolderEntry, error) {
+	// 1) Верхний уровень: явный вызов без parent_entity_uid.
+	top, err := c.listTreeTopLevel(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var out []FolderEntry
 	visited := map[string]bool{}
 
-	var walk func(parentUID, parentPath string) error
-	walk = func(parentUID, parentPath string) error {
-		children, err := c.ListTreeChildrenAll(ctx, parentUID)
-		if err != nil {
-			return err
-		}
-		for _, ch := range children {
+	var walk func(items []TreeEntity, parentPath string) error
+	walk = func(items []TreeEntity, parentPath string) error {
+		for _, ch := range items {
 			if ch.Archived || visited[ch.UID] {
 				continue
 			}
@@ -461,19 +468,50 @@ func (c *Client) ListAllDocumentGroups(ctx context.Context) ([]FolderEntry, erro
 					FullPath: fullPath,
 				})
 			}
-			// Рекурсия только в контейнеры (spaces и folders).
+			// Рекурсия в контейнеры (space и document_group) с parent_entity_uid=текущий UID.
 			if ch.IsSpace() || ch.IsFolder() {
-				if err := walk(ch.UID, fullPath); err != nil {
+				children, err := c.ListTreeChildrenAll(ctx, ch.UID)
+				if err != nil {
+					return err
+				}
+				if err := walk(children, fullPath); err != nil {
 					return err
 				}
 			}
 		}
 		return nil
 	}
-	if err := walk("", ""); err != nil {
+	if err := walk(top, ""); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// listTreeTopLevel — GET /tree-entities без параметра parent_entity_uid.
+// Именно такой вызов возвращает плоский список верхнего уровня, включая
+// папки (document_group) с parent_entity_uid: null.
+func (c *Client) listTreeTopLevel(ctx context.Context) ([]TreeEntity, error) {
+	var all []TreeEntity
+	const pageSize = 500
+	for offset := 0; ; offset += pageSize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		u := fmt.Sprintf("%s?limit=%d&offset=%d", pathTreeEntities, pageSize, offset)
+		body, err := c.do(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		var page []TreeEntity
+		if err := json.Unmarshal(body, &page); err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if len(page) < pageSize {
+			break
+		}
+	}
+	return all, nil
 }
 
 // WalkTree — рекурсивный DFS-обход дерева от rootUID.
