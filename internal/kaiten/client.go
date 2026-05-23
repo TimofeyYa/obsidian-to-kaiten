@@ -296,15 +296,83 @@ const (
 
 // TreeEntity — элемент из GET /tree-entities.
 // EntityType определяет природу: space / document / document_group (папка) / story_map.
+//
+// ID может приходить как int, string или отсутствовать вообще (для документов в некоторых
+// инстансах возвращается только UID). UID — всегда присутствует и является основным
+// идентификатором.
 type TreeEntity struct {
 	UID             string  `json:"uid"`
-	ID              int     `json:"id,omitempty"`
+	ID              int     `json:"-"`
 	Title           string  `json:"title"`
 	EntityType      string  `json:"entity_type"`
 	ParentEntityUID *string `json:"parent_entity_uid,omitempty"`
 	Path            string  `json:"path,omitempty"`
 	SortOrder       float64 `json:"sort_order,omitempty"`
 	Archived        bool    `json:"archived,omitempty"`
+}
+
+// treeEntityAlias — технический тип для UnmarshalJSON без рекурсии.
+type treeEntityAlias struct {
+	UID             string          `json:"uid"`
+	ID              json.RawMessage `json:"id"`
+	Title           string          `json:"title"`
+	EntityType      string          `json:"entity_type"`
+	ParentEntityUID *string         `json:"parent_entity_uid,omitempty"`
+	Path            string          `json:"path,omitempty"`
+	SortOrder       float64         `json:"sort_order,omitempty"`
+	Archived        bool            `json:"archived,omitempty"`
+}
+
+// MarshalJSON — выводит id как number (для тестов).
+func (t TreeEntity) MarshalJSON() ([]byte, error) {
+	type out struct {
+		UID             string  `json:"uid"`
+		ID              int     `json:"id,omitempty"`
+		Title           string  `json:"title"`
+		EntityType      string  `json:"entity_type"`
+		ParentEntityUID *string `json:"parent_entity_uid,omitempty"`
+		Path            string  `json:"path,omitempty"`
+		SortOrder       float64 `json:"sort_order,omitempty"`
+		Archived        bool    `json:"archived,omitempty"`
+	}
+	return json.Marshal(out{
+		UID: t.UID, ID: t.ID, Title: t.Title, EntityType: t.EntityType,
+		ParentEntityUID: t.ParentEntityUID, Path: t.Path,
+		SortOrder: t.SortOrder, Archived: t.Archived,
+	})
+}
+
+// UnmarshalJSON принимает id как string / number / отсутствующее.
+// Аналогично Document.UnmarshalJSON, но без fallback в UID (UID уже есть).
+func (t *TreeEntity) UnmarshalJSON(data []byte) error {
+	var raw treeEntityAlias
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	t.UID = raw.UID
+	t.Title = raw.Title
+	t.EntityType = raw.EntityType
+	t.ParentEntityUID = raw.ParentEntityUID
+	t.Path = raw.Path
+	t.SortOrder = raw.SortOrder
+	t.Archived = raw.Archived
+	if len(raw.ID) == 0 || string(raw.ID) == "null" {
+		return nil
+	}
+	if raw.ID[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw.ID, &s); err != nil {
+			return err
+		}
+		if s == "" {
+			return nil
+		}
+		if n, err := strconv.Atoi(s); err == nil {
+			t.ID = n
+		}
+		return nil
+	}
+	return json.Unmarshal(raw.ID, &t.ID)
 }
 
 // IsFolder — true для document_group.
@@ -394,9 +462,23 @@ func (c *Client) ListDocuments(ctx context.Context, spaceID int) ([]Document, er
 	return out, nil
 }
 
-// GetDocument — полный документ с контентом.
+// GetDocument — полный документ с контентом по числовому ID.
 func (c *Client) GetDocument(ctx context.Context, id int) (*Document, error) {
 	body, err := c.do(ctx, http.MethodGet, fmt.Sprintf(DocPath, id), nil)
+	if err != nil {
+		return nil, err
+	}
+	var d Document
+	if err := json.Unmarshal(body, &d); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// GetDocumentByUID — полный документ по UID.
+// По доке Kaiten это основной идентификатор (DELETE /documents/{document_uid}).
+func (c *Client) GetDocumentByUID(ctx context.Context, uid string) (*Document, error) {
+	body, err := c.do(ctx, http.MethodGet, "/documents/"+uid, nil)
 	if err != nil {
 		return nil, err
 	}

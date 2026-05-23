@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -151,7 +152,7 @@ func (m *mockKaiten) handle(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/api/latest/documents/"):
-		id := parseDocID(path)
+		id := m.resolveDocID(path)
 		d, ok := m.docs[id]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
@@ -160,7 +161,7 @@ func (m *mockKaiten) handle(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(d)
 
 	case r.Method == http.MethodPatch && strings.HasPrefix(path, "/api/latest/documents/"):
-		id := parseDocID(path)
+		id := m.resolveDocID(path)
 		d, ok := m.docs[id]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
@@ -221,11 +222,23 @@ func (m *mockKaiten) patchCount(id int) int {
 	return m.patchHit[id]
 }
 
-func parseDocID(path string) int {
+// resolveDocID — принимает и числовой ID, и UID вида "doc-uid-<n>".
+func (m *mockKaiten) resolveDocID(path string) int {
 	tail := strings.TrimPrefix(path, "/api/latest/documents/")
-	var id int
-	_, _ = fmt.Sscanf(tail, "%d", &id)
-	return id
+	// Отбрасываем возможный хвост /files или другие сегменты.
+	if i := strings.Index(tail, "/"); i >= 0 {
+		tail = tail[:i]
+	}
+	if n, err := strconv.Atoi(tail); err == nil {
+		return n
+	}
+	// UID-формат "doc-uid-<n>".
+	if strings.HasPrefix(tail, "doc-uid-") {
+		var n int
+		_, _ = fmt.Sscanf(strings.TrimPrefix(tail, "doc-uid-"), "%d", &n)
+		return n
+	}
+	return 0
 }
 
 func parseDocIDFromFilesPath(path string) int {

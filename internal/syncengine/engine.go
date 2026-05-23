@@ -123,16 +123,29 @@ func (e *Engine) Run(ctx context.Context, rootUID string) (rep Report, runErr er
 		}
 	}
 
-	// 3. Подтягиваем полный контент каждого документа + вычисляем relPath в vault.
+	// 3. Подтягиваем полный контент каждого документа.
+	// Приоритет идентификатора: UID (основной в Kaiten API) → числовой ID (legacy).
 	full := make([]kaiten.Document, 0, len(docEntities))
-	docRelPath := make(map[int]string, len(docEntities))
+	docRelPath := make(map[string]string, len(docEntities))
 	for _, en := range docEntities {
 		if err := ctx.Err(); err != nil {
 			return rep, err
 		}
-		d, derr := e.Client.GetDocument(ctx, en.ID)
+		var (
+			d    *kaiten.Document
+			derr error
+		)
+		switch {
+		case en.UID != "":
+			d, derr = e.Client.GetDocumentByUID(ctx, en.UID)
+		case en.ID != 0:
+			d, derr = e.Client.GetDocument(ctx, en.ID)
+		default:
+			e.Logger.Warn("документ без UID и ID — пропуск", "title", en.Title)
+			continue
+		}
 		if derr != nil {
-			e.Logger.Warn("не удалось получить документ", "id", en.ID, "err", derr)
+			e.Logger.Warn("не удалось получить документ", "uid", en.UID, "id", en.ID, "err", derr)
 			rep.Errors++
 			continue
 		}
@@ -140,9 +153,20 @@ func (e *Engine) Run(ctx context.Context, rootUID string) (rep Report, runErr er
 			// Карточные документы игнорируем (по ТЗ).
 			continue
 		}
+		// Если GET по UID вернул ID=0, а в TreeEntity был ID — подхватываем.
+		if d.ID == 0 && en.ID != 0 {
+			d.ID = en.ID
+		}
+		if d.UID == "" && en.UID != "" {
+			d.UID = en.UID
+		}
 		full = append(full, *d)
 		if en.ParentEntityUID != nil {
-			docRelPath[d.ID] = folderPath[*en.ParentEntityUID]
+			key := d.UID
+			if key == "" {
+				key = strconv.Itoa(d.ID)
+			}
+			docRelPath[key] = folderPath[*en.ParentEntityUID]
 		}
 	}
 
@@ -171,7 +195,11 @@ func (e *Engine) Run(ctx context.Context, rootUID string) (rep Report, runErr er
 			return rep, err
 		}
 		if dec.Remote != nil {
-			e.docRelHint = docRelPath[dec.Remote.ID]
+			key := dec.Remote.UID
+			if key == "" {
+				key = strconv.Itoa(dec.Remote.ID)
+			}
+			e.docRelHint = docRelPath[key]
 		} else {
 			e.docRelHint = ""
 		}
