@@ -68,7 +68,7 @@ func TestE2E_PathTraversalBlocked(t *testing.T) {
 	mk := newMockKaiten(42, doc)
 	srv := mk.start(t)
 	eng := newTestEngine(t, vault, srv)
-	rep, err := eng.Run(context.Background(), 42)
+	rep, err := eng.Run(context.Background(), testRootUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestEngine_LastSuccessOnHappyPath(t *testing.T) {
 	eng := newTestEngine(t, vault, srv)
 
 	before := time.Now()
-	if _, err := eng.Run(context.Background(), 42); err != nil {
+	if _, err := eng.Run(context.Background(), testRootUID); err != nil {
 		t.Fatal(err)
 	}
 	if eng.State.LastSuccess.Before(before.Add(-time.Second)) {
@@ -176,7 +176,7 @@ func TestEngine_LastErrorOnFailure(t *testing.T) {
 		State:   state,
 		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	_, err := eng.Run(context.Background(), 42)
+	_, err := eng.Run(context.Background(), testRootUID)
 	if err == nil {
 		t.Fatal("ожидалась ошибка")
 	}
@@ -197,7 +197,7 @@ func TestEngine_DryRunDoesNotMutateStateOnPull(t *testing.T) {
 	eng := newTestEngine(t, vault, srv)
 	eng.DryRun = true
 
-	if _, err := eng.Run(context.Background(), 42); err != nil {
+	if _, err := eng.Run(context.Background(), testRootUID); err != nil {
 		t.Fatal(err)
 	}
 	// В DryRun state.Documents не должен пополниться (R-13).
@@ -213,7 +213,7 @@ func TestE2E_ConflictBackupIsHidden(t *testing.T) {
 	mk := newMockKaiten(42, newDoc(1, "Doc", "v1\n", updated))
 	srv := mk.start(t)
 	eng1 := newTestEngine(t, vault, srv)
-	if _, err := eng1.Run(context.Background(), 42); err != nil {
+	if _, err := eng1.Run(context.Background(), testRootUID); err != nil {
 		t.Fatal(err)
 	}
 	// Готовим конфликт.
@@ -225,7 +225,7 @@ func TestE2E_ConflictBackupIsHidden(t *testing.T) {
 	mk.updateRemote(1, "remote-version\n", updated.Add(2*time.Hour))
 
 	eng2 := newTestEngine(t, vault, srv)
-	if _, err := eng2.Run(context.Background(), 42); err != nil {
+	if _, err := eng2.Run(context.Background(), testRootUID); err != nil {
 		t.Fatal(err)
 	}
 	// Backup должен начинаться с точки.
@@ -235,7 +235,7 @@ func TestE2E_ConflictBackupIsHidden(t *testing.T) {
 	}
 	// На третьем проходе Walk не должен видеть backup → 0 решений по новому ID.
 	eng3 := newTestEngine(t, vault, srv)
-	rep, err := eng3.Run(context.Background(), 42)
+	rep, err := eng3.Run(context.Background(), testRootUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestE2E_BackupFailureBlocksPull(t *testing.T) {
 	mk := newMockKaiten(42, newDoc(1, "Doc", "v1\n", updated))
 	srv := mk.start(t)
 	eng1 := newTestEngine(t, vault, srv)
-	if _, err := eng1.Run(context.Background(), 42); err != nil {
+	if _, err := eng1.Run(context.Background(), testRootUID); err != nil {
 		t.Fatal(err)
 	}
 	// Готовим конфликт.
@@ -273,7 +273,7 @@ func TestE2E_BackupFailureBlocksPull(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(vault, 0o755) })
 
 	eng2 := newTestEngine(t, vault, srv)
-	rep, _ := eng2.Run(context.Background(), 42)
+	rep, _ := eng2.Run(context.Background(), testRootUID)
 	// Ожидаем: conflicts=1, errors>=1 (backup упал → pull пропущен).
 	if rep.Conflicts != 1 || rep.Errors < 1 {
 		t.Errorf("ожидался conflict + error, получено: %s", rep)

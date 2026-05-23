@@ -25,19 +25,31 @@ import (
 
 // ---------- Mock Kaiten ----------
 
-// mockKaiten — потокобезопасный мок Kaiten API.
+// testRootUID — фиксированный UID корневой папки/пространства в тестах.
+const testRootUID = "root-uid"
+
+// mockKaiten — потокобезопасный мок Kaiten API с поддержкой
+// tree-entities, document attachments и patch document.
 type mockKaiten struct {
-	mu       sync.Mutex
-	docs     map[int]*kaiten.Document // documents by ID
-	spaceID  int
-	patchHit map[int]int // сколько раз PATCH вызывался для документа
+	mu           sync.Mutex
+	docs         map[int]*kaiten.Document     // documents by ID
+	attach       map[int][]*kaiten.Attachment // attachments by docID
+	attachData   map[int][]byte               // content by attachment ID (для Download)
+	nextAttachID int
+	rootUID      string
+	patchHit     map[int]int
+	uploads      map[int]int // количество заливок attachments по docID
 }
 
-func newMockKaiten(spaceID int, docs ...kaiten.Document) *mockKaiten {
+func newMockKaiten(_ int, docs ...kaiten.Document) *mockKaiten {
 	m := &mockKaiten{
-		docs:     map[int]*kaiten.Document{},
-		spaceID:  spaceID,
-		patchHit: map[int]int{},
+		docs:         map[int]*kaiten.Document{},
+		attach:       map[int][]*kaiten.Attachment{},
+		attachData:   map[int][]byte{},
+		rootUID:      testRootUID,
+		patchHit:     map[int]int{},
+		uploads:      map[int]int{},
+		nextAttachID: 1000,
 	}
 	for i := range docs {
 		d := docs[i]
@@ -57,19 +69,89 @@ func (m *mockKaiten) handle(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	path := r.URL.Path
+
 	switch {
-	case r.Method == http.MethodGet && r.URL.Path == "/api/latest/users/current":
+	case r.Method == http.MethodGet && path == "/api/latest/users/current":
 		_ = json.NewEncoder(w).Encode(kaiten.User{ID: 1, Email: "t@e", FullName: "Tester"})
 
-	case r.Method == http.MethodGet && r.URL.Path == fmt.Sprintf("/api/latest/spaces/%d/documents", m.spaceID):
-		out := make([]kaiten.Document, 0, len(m.docs))
+	case r.Method == http.MethodGet && path == "/api/latest/tree-entities":
+		// Простая модель: все документы висят на testRootUID.
+		parent := r.URL.Query().Get("parent_entity_uid")
+		if parent != m.rootUID {
+			_ = json.NewEncoder(w).Encode([]kaiten.TreeEntity{})
+			return
+		}
+		out := make([]kaiten.TreeEntity, 0, len(m.docs))
+		parentUID := m.rootUID
 		for _, d := range m.docs {
-			out = append(out, *d)
+			out = append(out, kaiten.TreeEntity{
+				UID:             fmt.Sprintf("doc-uid-%d", d.ID),
+				ID:              d.ID,
+				Title:           d.Title,
+				EntityType:      kaiten.EntityTypeDocument,
+				ParentEntityUID: &parentUID,
+			})
 		}
 		_ = json.NewEncoder(w).Encode(out)
 
-	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/latest/documents/"):
-		id := parseDocID(r.URL.Path)
+	case r.Method == http.MethodGet && strings.HasSuffix(path, "/files") &&
+		strings.HasPrefix(path, "/api/latest/documents/"):
+		id := parseDocIDFromFilesPath(path)
+		list := m.attach[id]
+		out := make([]kaiten.Attachment, 0, len(list))
+		for _, a := range list {
+			out = append(out, *a)
+		}
+		_ = json.NewEncoder(w).Encode(out)
+
+	case r.Method == http.MethodPut && strings.HasSuffix(path, "/files") &&
+		strings.HasPrefix(path, "/api/latest/documents/"):
+		// Upload (multipart). Парсим форму.
+		id := parseDocIDFromFilesPath(path)
+		_ = r.ParseMultipartForm(64 << 20)
+		f, fh, err := r.FormFile("file")
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		defer func() { _ = f.Close() }()
+		data, _ := io.ReadAll(f)
+		m.nextAttachID++
+		a := &kaiten.Attachment{
+			ID:   m.nextAttachID,
+			Name: fh.Filename,
+			Size: int64(len(data)),
+			URL:  fmt.Sprintf("http://%s/api/latest/_attach_blob/%d", r.Host, m.nextAttachID),
+		}
+		m.attach[id] = append(m.attach[id], a)
+		m.attachData[a.ID] = data
+		m.uploads[id]++
+		_ = json.NewEncoder(w).Encode(a)
+
+	case r.Method == http.MethodDelete && strings.HasPrefix(path, "/api/latest/documents/") &&
+		strings.Contains(path, "/files/"):
+		docID, fileID := parseDocAndFileID(path)
+		filtered := m.attach[docID][:0]
+		for _, a := range m.attach[docID] {
+			if a.ID != fileID {
+				filtered = append(filtered, a)
+			}
+		}
+		m.attach[docID] = filtered
+		w.WriteHeader(http.StatusNoContent)
+
+	case r.Method == http.MethodGet && strings.HasPrefix(path, "/api/latest/_attach_blob/"):
+		var id int
+		_, _ = fmt.Sscanf(strings.TrimPrefix(path, "/api/latest/_attach_blob/"), "%d", &id)
+		if data, ok := m.attachData[id]; ok {
+			_, _ = w.Write(data)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+
+	case r.Method == http.MethodGet && strings.HasPrefix(path, "/api/latest/documents/"):
+		id := parseDocID(path)
 		d, ok := m.docs[id]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
@@ -77,8 +159,8 @@ func (m *mockKaiten) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewEncoder(w).Encode(d)
 
-	case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/api/latest/documents/"):
-		id := parseDocID(r.URL.Path)
+	case r.Method == http.MethodPatch && strings.HasPrefix(path, "/api/latest/documents/"):
+		id := parseDocID(path)
 		d, ok := m.docs[id]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
@@ -146,6 +228,28 @@ func parseDocID(path string) int {
 	return id
 }
 
+func parseDocIDFromFilesPath(path string) int {
+	// /api/latest/documents/{id}/files
+	parts := strings.Split(strings.TrimPrefix(path, "/api/latest/documents/"), "/")
+	var id int
+	if len(parts) > 0 {
+		_, _ = fmt.Sscanf(parts[0], "%d", &id)
+	}
+	return id
+}
+
+func parseDocAndFileID(path string) (int, int) {
+	// /api/latest/documents/{docID}/files/{fileID}
+	tail := strings.TrimPrefix(path, "/api/latest/documents/")
+	parts := strings.Split(tail, "/")
+	var docID, fileID int
+	if len(parts) >= 3 {
+		_, _ = fmt.Sscanf(parts[0], "%d", &docID)
+		_, _ = fmt.Sscanf(parts[2], "%d", &fileID)
+	}
+	return docID, fileID
+}
+
 // ---------- Test helpers ----------
 
 func newTestEngine(t *testing.T, vault string, srv *httptest.Server) *Engine {
@@ -201,7 +305,7 @@ func TestE2E_InitialPull(t *testing.T) {
 	srv := mk.start(t)
 	eng := newTestEngine(t, vault, srv)
 
-	rep, err := eng.Run(context.Background(), 42)
+	rep, err := eng.Run(context.Background(), testRootUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,14 +328,14 @@ func TestE2E_RemoteChange(t *testing.T) {
 	srv := mk.start(t)
 	eng := newTestEngine(t, vault, srv)
 
-	if _, err := eng.Run(context.Background(), 42); err != nil {
+	if _, err := eng.Run(context.Background(), testRootUID); err != nil {
 		t.Fatal(err)
 	}
 	// Меняем remote.
 	mk.updateRemote(1, "v2-from-kaiten", updated.Add(time.Hour))
 	// Повторный синк.
 	eng2 := newTestEngine(t, vault, srv)
-	rep, err := eng2.Run(context.Background(), 42)
+	rep, err := eng2.Run(context.Background(), testRootUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +355,7 @@ func TestE2E_LocalChange(t *testing.T) {
 	srv := mk.start(t)
 	eng := newTestEngine(t, vault, srv)
 
-	if _, err := eng.Run(context.Background(), 42); err != nil {
+	if _, err := eng.Run(context.Background(), testRootUID); err != nil {
 		t.Fatal(err)
 	}
 	// Эмулируем правку пользователя: перезаписываем body + двигаем mtime вперёд.
@@ -267,7 +371,7 @@ func TestE2E_LocalChange(t *testing.T) {
 	_ = os.Chtimes(abs, future, future)
 
 	eng2 := newTestEngine(t, vault, srv)
-	rep, err := eng2.Run(context.Background(), 42)
+	rep, err := eng2.Run(context.Background(), testRootUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +392,7 @@ func TestE2E_Conflict(t *testing.T) {
 	mk := newMockKaiten(42, newDoc(1, "Doc", "v1\n", updated))
 	srv := mk.start(t)
 	eng := newTestEngine(t, vault, srv)
-	if _, err := eng.Run(context.Background(), 42); err != nil {
+	if _, err := eng.Run(context.Background(), testRootUID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -302,7 +406,7 @@ func TestE2E_Conflict(t *testing.T) {
 	mk.updateRemote(1, "remote-version\n", updated.Add(2*time.Hour))
 
 	eng2 := newTestEngine(t, vault, srv)
-	rep, err := eng2.Run(context.Background(), 42)
+	rep, err := eng2.Run(context.Background(), testRootUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +441,7 @@ func TestE2E_CardLevelDocsIgnored(t *testing.T) {
 	)
 	srv := mk.start(t)
 	eng := newTestEngine(t, vault, srv)
-	rep, err := eng.Run(context.Background(), 42)
+	rep, err := eng.Run(context.Background(), testRootUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +464,7 @@ func TestE2E_HiddenFolderSkipped(t *testing.T) {
 	mk := newMockKaiten(42)
 	srv := mk.start(t)
 	eng := newTestEngine(t, vault, srv)
-	rep, err := eng.Run(context.Background(), 42)
+	rep, err := eng.Run(context.Background(), testRootUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,7 +482,7 @@ func TestE2E_DryRun(t *testing.T) {
 	eng := newTestEngine(t, vault, srv)
 	eng.DryRun = true
 
-	rep, err := eng.Run(context.Background(), 42)
+	rep, err := eng.Run(context.Background(), testRootUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,12 +507,12 @@ func TestE2E_Unchanged(t *testing.T) {
 
 	// Первый прогон.
 	eng1 := newTestEngine(t, vault, srv)
-	if _, err := eng1.Run(context.Background(), 42); err != nil {
+	if _, err := eng1.Run(context.Background(), testRootUID); err != nil {
 		t.Fatal(err)
 	}
 	// Второй прогон без изменений — должен быть только Skipped.
 	eng2 := newTestEngine(t, vault, srv)
-	rep, err := eng2.Run(context.Background(), 42)
+	rep, err := eng2.Run(context.Background(), testRootUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,14 +530,14 @@ func TestE2E_DeletedRemote(t *testing.T) {
 	mk := newMockKaiten(42, newDoc(1, "Doc", "v1\n", updated))
 	srv := mk.start(t)
 	eng1 := newTestEngine(t, vault, srv)
-	if _, err := eng1.Run(context.Background(), 42); err != nil {
+	if _, err := eng1.Run(context.Background(), testRootUID); err != nil {
 		t.Fatal(err)
 	}
 	// Удаляем remote.
 	mk.deleteRemote(1)
 
 	eng2 := newTestEngine(t, vault, srv)
-	rep, err := eng2.Run(context.Background(), 42)
+	rep, err := eng2.Run(context.Background(), testRootUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -459,7 +563,7 @@ func TestE2E_HTMLConversion(t *testing.T) {
 	srv := mk.start(t)
 	eng := newTestEngine(t, vault, srv)
 
-	if _, err := eng.Run(context.Background(), 42); err != nil {
+	if _, err := eng.Run(context.Background(), testRootUID); err != nil {
 		t.Fatal(err)
 	}
 	body, _ := os.ReadFile(filepath.Join(vault, "HTMLDoc.md"))
@@ -485,7 +589,7 @@ func TestPullRemote_ZeroUpdated(t *testing.T) {
 	srv := mk.start(t)
 	eng := newTestEngine(t, vault, srv)
 
-	if _, err := eng.Run(context.Background(), 42); err != nil {
+	if _, err := eng.Run(context.Background(), testRootUID); err != nil {
 		t.Fatal(err)
 	}
 	st, ok := eng.State.Documents["1"]
@@ -579,7 +683,7 @@ func TestEngine_ContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // отменяем сразу
 
-	_, err := eng.Run(ctx, 42)
+	_, err := eng.Run(ctx, testRootUID)
 	if err == nil {
 		t.Fatal("ожидалась ошибка отмены контекста")
 	}
@@ -605,7 +709,7 @@ func TestE2E_NoFlappingAfterPush(t *testing.T) {
 	srv := mk.start(t)
 
 	eng1 := newTestEngine(t, vault, srv)
-	if _, err := eng1.Run(context.Background(), 42); err != nil {
+	if _, err := eng1.Run(context.Background(), testRootUID); err != nil {
 		t.Fatal(err)
 	}
 	// Локально редактируем.
@@ -617,12 +721,12 @@ func TestE2E_NoFlappingAfterPush(t *testing.T) {
 
 	// Push.
 	eng2 := newTestEngine(t, vault, srv)
-	if _, err := eng2.Run(context.Background(), 42); err != nil {
+	if _, err := eng2.Run(context.Background(), testRootUID); err != nil {
 		t.Fatal(err)
 	}
 	// Повторный синк без новых правок.
 	eng3 := newTestEngine(t, vault, srv)
-	rep, err := eng3.Run(context.Background(), 42)
+	rep, err := eng3.Run(context.Background(), testRootUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -631,5 +735,171 @@ func TestE2E_NoFlappingAfterPush(t *testing.T) {
 	}
 	if mk.patchCount(1) != 1 {
 		t.Errorf("PATCH должен был случиться ровно 1 раз, было %d", mk.patchCount(1))
+	}
+}
+
+// E2E: attachments скачиваются из Kaiten в <vault>/kaiten_files/<docID>/.
+func TestE2E_AttachmentsDownload(t *testing.T) {
+	vault := t.TempDir()
+	updated := time.Now().UTC()
+	mk := newMockKaiten(0, newDoc(1, "Doc", "v1\n", updated))
+	// Подкладываем remote attachment.
+	mk.attach[1] = []*kaiten.Attachment{
+		{ID: 5001, Name: "report.pdf", Size: 5, URL: ""},
+	}
+	mk.attachData[5001] = []byte("HELLO")
+	srv := mk.start(t)
+	// URL зависит от srv, проставляем после старта.
+	mk.attach[1][0].URL = srv.URL + "/api/latest/_attach_blob/5001"
+
+	eng := newTestEngine(t, vault, srv)
+	rep, err := eng.Run(context.Background(), testRootUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.AttachmentsDown != 1 {
+		t.Errorf("ожидался 1 attach_down, получено: %s", rep)
+	}
+	dst := filepath.Join(vault, AttachmentsDir, "1", "report.pdf")
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("файл не создан: %v", err)
+	}
+	if string(data) != "HELLO" {
+		t.Errorf("содержимое файла повреждено: %q", data)
+	}
+}
+
+// E2E: локальный файл в kaiten_files/<docID>/ заливается в Kaiten как attachment.
+func TestE2E_AttachmentsUpload(t *testing.T) {
+	vault := t.TempDir()
+	updated := time.Now().UTC()
+	mk := newMockKaiten(0, newDoc(1, "Doc", "v1\n", updated))
+	srv := mk.start(t)
+
+	// Кладём локальный файл ДО синка.
+	docDir := filepath.Join(vault, AttachmentsDir, "1")
+	if err := os.MkdirAll(docDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(docDir, "notes.txt"), []byte("local content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := newTestEngine(t, vault, srv)
+	rep, err := eng.Run(context.Background(), testRootUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.AttachmentsUp != 1 {
+		t.Errorf("ожидался 1 attach_up, получено: %s", rep)
+	}
+	if mk.uploads[1] != 1 {
+		t.Errorf("сервер получил %d upload'ов, ожидался 1", mk.uploads[1])
+	}
+	if len(mk.attach[1]) != 1 || mk.attach[1][0].Name != "notes.txt" {
+		t.Errorf("attachment на сервере: %+v", mk.attach[1])
+	}
+}
+
+// E2E: при конфликте (одинаковое имя, разный размер) локальный выигрывает —
+// в Kaiten остаётся только локальная версия.
+func TestE2E_AttachmentLocalWinsConflict(t *testing.T) {
+	vault := t.TempDir()
+	updated := time.Now().UTC()
+	mk := newMockKaiten(0, newDoc(1, "Doc", "v1\n", updated))
+	// Remote: file.txt со старым содержимым.
+	mk.attach[1] = []*kaiten.Attachment{
+		{ID: 5001, Name: "file.txt", Size: 3, URL: ""},
+	}
+	mk.attachData[5001] = []byte("OLD")
+	srv := mk.start(t)
+	mk.attach[1][0].URL = srv.URL + "/api/latest/_attach_blob/5001"
+
+	// Local: file.txt с новым содержимым (другой размер).
+	docDir := filepath.Join(vault, AttachmentsDir, "1")
+	if err := os.MkdirAll(docDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(docDir, "file.txt"), []byte("NEW LOCAL"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := newTestEngine(t, vault, srv)
+	if _, err := eng.Run(context.Background(), testRootUID); err != nil {
+		t.Fatal(err)
+	}
+	// На сервере должен остаться один attachment — с новым содержимым (локальный выиграл).
+	if len(mk.attach[1]) != 1 {
+		t.Fatalf("ожидался 1 attachment, найдено: %+v", mk.attach[1])
+	}
+	got := mk.attach[1][0]
+	if got.Size != int64(len("NEW LOCAL")) {
+		t.Errorf("размер на сервере = %d, ожидалось %d", got.Size, len("NEW LOCAL"))
+	}
+}
+
+// E2E: рекурсивный обход папок (tree-entities) — структура отражается в vault.
+func TestE2E_FolderHierarchyMirrored(t *testing.T) {
+	vault := t.TempDir()
+	updated := time.Now().UTC()
+
+	mk := &mockKaiten{
+		docs:         map[int]*kaiten.Document{},
+		attach:       map[int][]*kaiten.Attachment{},
+		attachData:   map[int][]byte{},
+		patchHit:     map[int]int{},
+		uploads:      map[int]int{},
+		nextAttachID: 1000,
+		rootUID:      testRootUID,
+	}
+	// Документ в подпапке "Subfolder".
+	doc := newDoc(1, "Nested Doc", "body\n", updated)
+	mk.docs[1] = &doc
+
+	// Кастомный handler: возвращаем дерево вручную.
+	subUID := "sub-folder-uid"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mk.mu.Lock()
+		defer mk.mu.Unlock()
+		switch {
+		case r.URL.Path == "/api/latest/tree-entities":
+			parent := r.URL.Query().Get("parent_entity_uid")
+			rootParent := mk.rootUID
+			subParent := subUID
+			switch parent {
+			case mk.rootUID:
+				_ = json.NewEncoder(w).Encode([]kaiten.TreeEntity{
+					{UID: subUID, Title: "Subfolder", EntityType: kaiten.EntityTypeDocumentGroup, ParentEntityUID: &rootParent},
+				})
+			case subUID:
+				_ = json.NewEncoder(w).Encode([]kaiten.TreeEntity{
+					{UID: "doc-uid-1", ID: 1, Title: "Nested Doc", EntityType: kaiten.EntityTypeDocument, ParentEntityUID: &subParent},
+				})
+			default:
+				_ = json.NewEncoder(w).Encode([]kaiten.TreeEntity{})
+			}
+		case strings.HasPrefix(r.URL.Path, "/api/latest/documents/") && strings.HasSuffix(r.URL.Path, "/files"):
+			_ = json.NewEncoder(w).Encode([]kaiten.Attachment{})
+		case strings.HasPrefix(r.URL.Path, "/api/latest/documents/"):
+			_ = json.NewEncoder(w).Encode(mk.docs[1])
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	eng := newTestEngine(t, vault, srv)
+	if _, err := eng.Run(context.Background(), testRootUID); err != nil {
+		t.Fatal(err)
+	}
+	// Проверяем, что файл лёг в Subfolder/.
+	expected := filepath.Join(vault, "Subfolder", "Nested Doc.md")
+	if _, err := os.Stat(expected); err != nil {
+		t.Errorf("файл не создан в правильной папке: %v\nfiles in vault:", err)
+		_ = filepath.Walk(vault, func(p string, _ os.FileInfo, _ error) error {
+			t.Logf("  %s", p)
+			return nil
+		})
 	}
 }

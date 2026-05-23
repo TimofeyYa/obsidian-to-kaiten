@@ -21,7 +21,7 @@ func TestSaveLoad_KeyringFallback(t *testing.T) {
 	cfg := &Config{
 		BaseURL:  "https://x.kaiten.ru",
 		VaultDir: "/tmp/vault",
-		SpaceID:  42,
+		RootUID:  "root-uid",
 		Token:    "secret-token",
 	}
 
@@ -53,7 +53,7 @@ func TestSaveLoad_KeyringFallback(t *testing.T) {
 	if loaded.Token != "secret-token" {
 		t.Errorf("токен не подгружен из keyring: %q", loaded.Token)
 	}
-	if loaded.BaseURL != cfg.BaseURL || loaded.SpaceID != cfg.SpaceID {
+	if loaded.BaseURL != cfg.BaseURL || loaded.RootUID != cfg.RootUID {
 		t.Errorf("конфиг повреждён: %+v", loaded)
 	}
 }
@@ -73,7 +73,8 @@ func TestValidate(t *testing.T) {
 		{&Config{}, true},
 		{&Config{BaseURL: "x"}, true},
 		{&Config{BaseURL: "x", Token: "t"}, true},
-		{&Config{BaseURL: "x", Token: "t", VaultDir: "v"}, false},
+		{&Config{BaseURL: "x", Token: "t", VaultDir: "v"}, true}, // RootUID теперь обязателен
+		{&Config{BaseURL: "x", Token: "t", VaultDir: "v", RootUID: "r"}, false},
 	}
 	for i, tc := range cases {
 		err := tc.c.Validate()

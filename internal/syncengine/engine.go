@@ -16,17 +16,20 @@ import (
 
 // Report — итог по проходу синхронизации.
 type Report struct {
-	Synced    int // Kaiten → Obsidian
-	Uploaded  int // Obsidian → Kaiten
-	Conflicts int
-	NewLocal  int
-	Errors    int
-	Skipped   int
+	Synced             int // Kaiten → Obsidian (документы)
+	Uploaded           int // Obsidian → Kaiten (документы)
+	Conflicts          int
+	NewLocal           int
+	Errors             int
+	Skipped            int
+	AttachmentsDown    int // Kaiten → Obsidian (вложения)
+	AttachmentsUp      int // Obsidian → Kaiten (вложения)
+	AttachmentsSkipped int
 }
 
 func (r Report) String() string {
-	return fmt.Sprintf("synced=%d uploaded=%d conflicts=%d new_local=%d errors=%d skipped=%d",
-		r.Synced, r.Uploaded, r.Conflicts, r.NewLocal, r.Errors, r.Skipped)
+	return fmt.Sprintf("synced=%d uploaded=%d conflicts=%d new_local=%d errors=%d skipped=%d attach_down=%d attach_up=%d",
+		r.Synced, r.Uploaded, r.Conflicts, r.NewLocal, r.Errors, r.Skipped, r.AttachmentsDown, r.AttachmentsUp)
 }
 
 // HasErrors возвращает true, если в отчёте есть ошибки.
@@ -41,20 +44,26 @@ type Engine struct {
 	State   *State
 	Logger  *slog.Logger
 	DryRun  bool
+
+	// docRelHint — релативная директория в vault для текущего документа
+	// (вычисляется из иерархии tree-entities). Передаётся в targetRelPath.
+	docRelHint string
 }
 
-// Run выполняет полный цикл синхронизации для заданного spaceID.
-// Поддерживает отмену через ctx между этапами и документами.
+// AttachmentsDir — имя подпапки в vault, куда скачиваются вложения Kaiten.
+const AttachmentsDir = "kaiten_files"
+
+// Run выполняет полный цикл синхронизации для заданного корневого UID (папки или пространства).
+// Рекурсивно обходит дерево через GET /tree-entities, собирает все document'ы
+// и синхронизирует их (+ вложения) в vault.
 //
-// TODO(perf): сейчас N+1 запросов (ListDocuments + GetDocument для каждого).
-// На больших пространствах (>500 документов) при rate-limit 5 req/sec это
-// займёт ~100 секунд. Когда Kaiten добавит bulk-endpoint — переключиться.
-func (e *Engine) Run(ctx context.Context, spaceID int) (rep Report, runErr error) {
+// TODO(perf): сейчас N+1 запросов на каждый документ.
+func (e *Engine) Run(ctx context.Context, rootUID string) (rep Report, runErr error) {
 	defer func() {
 		// Записываем итог в state для healthcheck (риск R-07).
 		now := time.Now().UTC()
 		e.State.LastSync = now
-		e.State.SpaceID = spaceID
+		e.State.RootUID = rootUID
 		switch {
 		case runErr != nil:
 			e.State.LastError = runErr.Error()
@@ -66,55 +75,126 @@ func (e *Engine) Run(ctx context.Context, spaceID int) (rep Report, runErr error
 		}
 	}()
 
-	// 1. Получаем документы пространства.
-	remotes, err := e.Client.ListDocuments(ctx, spaceID)
+	// 1. Рекурсивно обходим дерево от rootUID.
+	entities, err := e.Client.WalkTree(ctx, rootUID)
 	if err != nil {
-		return rep, fmt.Errorf("список документов: %w", err)
+		return rep, fmt.Errorf("обход дерева Kaiten: %w", err)
+	}
+	e.Logger.Info("дерево Kaiten получено", "root", rootUID, "entities", len(entities))
+
+	// 2. Строим карту UID→path для папок и собираем документы.
+	folderPath := buildFolderPaths(rootUID, entities)
+	var docEntities []kaiten.TreeEntity
+	for _, en := range entities {
+		if en.IsDocument() {
+			docEntities = append(docEntities, en)
+		}
 	}
 
-	// 2. Подтягиваем полный контент для каждого документа.
-	full := make([]kaiten.Document, 0, len(remotes))
-	for i := range remotes {
+	// 3. Подтягиваем полный контент каждого документа + вычисляем relPath в vault.
+	full := make([]kaiten.Document, 0, len(docEntities))
+	docRelPath := make(map[int]string, len(docEntities))
+	for _, en := range docEntities {
 		if err := ctx.Err(); err != nil {
 			return rep, err
 		}
-		d, derr := e.Client.GetDocument(ctx, remotes[i].ID)
+		d, derr := e.Client.GetDocument(ctx, en.ID)
 		if derr != nil {
-			e.Logger.Warn("не удалось получить документ", "id", remotes[i].ID, "err", derr)
+			e.Logger.Warn("не удалось получить документ", "id", en.ID, "err", derr)
 			rep.Errors++
 			continue
 		}
+		if !d.IsSpaceLevel() {
+			// Карточные документы игнорируем (по ТЗ).
+			continue
+		}
 		full = append(full, *d)
+		if en.ParentEntityUID != nil {
+			docRelPath[d.ID] = folderPath[*en.ParentEntityUID]
+		}
 	}
 
-	// 3. Обходим vault.
+	// 4. Обходим vault.
 	locals, err := obsidian.Walk(e.Vault)
 	if err != nil {
 		return rep, fmt.Errorf("обход vault: %w", err)
 	}
 
-	// 4. Строим план.
+	// 5. Строим план.
 	decisions := BuildDecisions(full, locals, e.State)
 
-	// 5. Применяем.
+	// 6. Применяем.
 	for _, dec := range decisions {
 		if err := ctx.Err(); err != nil {
 			return rep, err
+		}
+		if dec.Remote != nil {
+			e.docRelHint = docRelPath[dec.Remote.ID]
+		} else {
+			e.docRelHint = ""
 		}
 		if aerr := e.apply(ctx, dec, &rep); aerr != nil {
 			e.Logger.Error("ошибка применения", "doc_id", dec.KaitenID, "dir", dec.Direction, "err", aerr)
 			rep.Errors++
 		}
+		// Синхронизируем вложения для этого документа (если есть remote).
+		if dec.Remote != nil && dec.Direction != NewLocal && dec.Direction != DeletedRemote {
+			if aerr := e.syncAttachments(ctx, dec.Remote.ID, &rep); aerr != nil {
+				e.Logger.Warn("ошибка синка вложений", "doc_id", dec.KaitenID, "err", aerr)
+				rep.Errors++
+			}
+		}
 	}
 
-	// 6. Сохраняем state (НЕ в DryRun).
+	// 7. Сохраняем state (НЕ в DryRun).
 	if !e.DryRun {
-		// LastSync/LastSuccess проставляются в defer.
 		if err := SaveState(e.Vault, e.State); err != nil {
 			return rep, fmt.Errorf("сохранение state: %w", err)
 		}
 	}
 	return rep, nil
+}
+
+// buildFolderPaths — для каждой папки/пространства вычисляет относительный путь
+// от rootUID, чтобы отразить иерархию в файловой системе vault.
+// rootUID сам не входит в путь (его содержимое ложится в корень vault).
+func buildFolderPaths(rootUID string, entities []kaiten.TreeEntity) map[string]string {
+	byUID := make(map[string]kaiten.TreeEntity, len(entities))
+	for _, en := range entities {
+		byUID[en.UID] = en
+	}
+	paths := make(map[string]string, len(entities))
+	paths[rootUID] = ""
+	var resolve func(uid string) string
+	resolve = func(uid string) string {
+		if p, ok := paths[uid]; ok {
+			return p
+		}
+		en, ok := byUID[uid]
+		if !ok {
+			return ""
+		}
+		name := stripLeadingDots(obsidian.Sanitize(en.Title))
+		if en.ParentEntityUID == nil {
+			paths[uid] = name
+			return name
+		}
+		parent := resolve(*en.ParentEntityUID)
+		var p string
+		if parent == "" {
+			p = name
+		} else {
+			p = parent + "/" + name
+		}
+		paths[uid] = p
+		return p
+	}
+	for _, en := range entities {
+		if en.IsFolder() || en.IsSpace() {
+			resolve(en.UID)
+		}
+	}
+	return paths
 }
 
 // apply применяет одно решение и обновляет state.
@@ -330,15 +410,19 @@ func writeFileSync(path string, data []byte, mode os.FileMode) error {
 // targetRelPath вычисляет относительный путь .md в vault для документа Kaiten.
 // Если локальный файл уже есть — переиспользуем его путь, чтобы не дублировать.
 //
+// Приоритет источников для директории:
+//  1. e.docRelHint (из рекурсивного обхода tree-entities) — основной источник;
+//  2. r.Path (legacy, на случай ручных вызовов без обхода).
+//
 // Защита от:
-//   - R-04 (path traversal): любые `..` и абсолютные пути в r.Path игнорируются;
+//   - R-04 (path traversal): любые `..` и абсолютные пути игнорируются;
 //   - баг #1: ведущие точки в любом сегменте пути экранируются (.archive → archive).
 func (e *Engine) targetRelPath(r *kaiten.Document, local *obsidian.File) string {
 	if local != nil {
 		return local.RelPath
 	}
-	dir := ""
-	if r.Path != "" {
+	dir := e.docRelHint
+	if dir == "" && r.Path != "" {
 		parts := strings.Split(r.Path, "/")
 		clean := make([]string, 0, len(parts))
 		for _, p := range parts {
@@ -351,6 +435,134 @@ func (e *Engine) targetRelPath(r *kaiten.Document, local *obsidian.File) string 
 	}
 	name := stripLeadingDots(obsidian.Sanitize(r.Title)) + ".md"
 	return filepath.ToSlash(filepath.Join(dir, name))
+}
+
+// syncAttachments — синхронизирует вложения одного документа.
+// Правила (по ТЗ):
+//   - файлы Kaiten скачиваются в <vault>/kaiten_files/<docID>/<name>;
+//   - все локальные файлы в этой папке заливаются в Kaiten как attachments документа;
+//   - при конфликте локальный выигрывает (заливаем в Kaiten поверх).
+//
+// В DryRun только логируем план.
+func (e *Engine) syncAttachments(ctx context.Context, docID int, rep *Report) error {
+	remotes, err := e.Client.ListDocumentAttachments(ctx, docID)
+	if err != nil {
+		// Эндпоинт может отсутствовать в старых инстансах (404). Не фатально — пропускаем.
+		if strings.Contains(err.Error(), " 404 ") {
+			e.Logger.Debug("вложения недоступны для этого документа (404)", "doc_id", docID)
+			return nil
+		}
+		return fmt.Errorf("list attachments: %w", err)
+	}
+
+	docDir := filepath.Join(e.Vault, AttachmentsDir, strconv.Itoa(docID))
+	if !e.DryRun {
+		if err := os.MkdirAll(docDir, 0o755); err != nil {
+			return fmt.Errorf("mkdir attachments: %w", err)
+		}
+	}
+
+	// Remote-файлы: имя → attachment.
+	remoteByName := make(map[string]kaiten.Attachment, len(remotes))
+	for _, a := range remotes {
+		remoteByName[obsidian.Sanitize(a.Name)] = a
+	}
+
+	// Local-файлы: имя → abspath.
+	localByName := map[string]string{}
+	if entries, err := os.ReadDir(docDir); err == nil {
+		for _, en := range entries {
+			if en.IsDir() || strings.HasPrefix(en.Name(), ".") {
+				continue
+			}
+			localByName[en.Name()] = filepath.Join(docDir, en.Name())
+		}
+	}
+
+	// 1) Локальные выигрывают (ТЗ). Для каждого локального — заливаем, если:
+	//    - его нет в Kaiten;
+	//    - или размер локального отличается от размера в Kaiten (были правки).
+	for name, absPath := range localByName {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		info, _ := os.Stat(absPath)
+		remote, hasRemote := remoteByName[name]
+		if hasRemote && info != nil && info.Size() == remote.Size {
+			rep.AttachmentsSkipped++
+			continue
+		}
+		if e.DryRun {
+			e.Logger.Info("would upload attachment", "doc_id", docID, "name", name)
+			rep.AttachmentsUp++
+			continue
+		}
+		f, oerr := os.Open(absPath) //nolint:gosec
+		if oerr != nil {
+			e.Logger.Warn("ошибка open attachment", "path", absPath, "err", oerr)
+			rep.Errors++
+			continue
+		}
+		// Если в Kaiten уже есть файл с тем же именем — сначала удаляем (локальный побеждает).
+		if hasRemote {
+			if derr := e.Client.DeleteDocumentAttachment(ctx, docID, remote.ID); derr != nil {
+				e.Logger.Warn("не удалось удалить старый attachment", "id", remote.ID, "err", derr)
+			}
+		}
+		_, uerr := e.Client.UploadDocumentAttachment(ctx, docID, name, f)
+		_ = f.Close()
+		if uerr != nil {
+			e.Logger.Warn("ошибка upload attachment", "doc_id", docID, "name", name, "err", uerr)
+			rep.Errors++
+			continue
+		}
+		rep.AttachmentsUp++
+		e.Logger.Info("attachment uploaded", "doc_id", docID, "name", name)
+	}
+
+	// 2) Скачиваем из Kaiten все вложения, которых нет локально.
+	for name, a := range remoteByName {
+		if _, ok := localByName[name]; ok {
+			continue // локальный выиграл выше или совпал
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		dst := filepath.Join(docDir, name)
+		if e.DryRun {
+			e.Logger.Info("would download attachment", "doc_id", docID, "name", name)
+			rep.AttachmentsDown++
+			continue
+		}
+		if a.URL == "" {
+			e.Logger.Warn("attachment без URL", "doc_id", docID, "name", name)
+			continue
+		}
+		tmp := dst + ".part"
+		f, ferr := os.Create(tmp) //nolint:gosec
+		if ferr != nil {
+			e.Logger.Warn("create attachment file", "path", tmp, "err", ferr)
+			rep.Errors++
+			continue
+		}
+		_, derr := e.Client.DownloadAttachment(ctx, a.URL, f)
+		_ = f.Close()
+		if derr != nil {
+			_ = os.Remove(tmp)
+			e.Logger.Warn("download attachment", "doc_id", docID, "name", name, "err", derr)
+			rep.Errors++
+			continue
+		}
+		if err := os.Rename(tmp, dst); err != nil {
+			_ = os.Remove(tmp)
+			rep.Errors++
+			continue
+		}
+		rep.AttachmentsDown++
+		e.Logger.Info("attachment downloaded", "doc_id", docID, "name", name)
+	}
+
+	return nil
 }
 
 // stripLeadingDots убирает ведущие точки и пробелы.

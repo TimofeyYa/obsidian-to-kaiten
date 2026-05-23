@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
@@ -191,6 +192,7 @@ type Space struct {
 // Поле Type принимает значения "html" или "markdown".
 type Document struct {
 	ID       int       `json:"id"`
+	UID      string    `json:"uid,omitempty"`
 	Title    string    `json:"title"`
 	Type     string    `json:"type"`
 	Content  string    `json:"content"`
@@ -199,6 +201,49 @@ type Document struct {
 	ParentID *int      `json:"parent_id,omitempty"`
 	Updated  time.Time `json:"updated"`
 	CardID   *int      `json:"card_id,omitempty"`
+}
+
+// Типы сущностей в tree-entities.
+const (
+	EntityTypeSpace         = "space"
+	EntityTypeDocument      = "document"
+	EntityTypeDocumentGroup = "document_group" // это и есть «папка»
+	EntityTypeStoryMap      = "story_map"
+)
+
+// TreeEntity — элемент из GET /tree-entities.
+// EntityType определяет природу: space / document / document_group (папка) / story_map.
+type TreeEntity struct {
+	UID             string  `json:"uid"`
+	ID              int     `json:"id,omitempty"`
+	Title           string  `json:"title"`
+	EntityType      string  `json:"entity_type"`
+	ParentEntityUID *string `json:"parent_entity_uid,omitempty"`
+	Path            string  `json:"path,omitempty"`
+	SortOrder       float64 `json:"sort_order,omitempty"`
+	Archived        bool    `json:"archived,omitempty"`
+}
+
+// IsFolder — true для document_group.
+func (t TreeEntity) IsFolder() bool { return t.EntityType == EntityTypeDocumentGroup }
+
+// IsDocument — true для document.
+func (t TreeEntity) IsDocument() bool { return t.EntityType == EntityTypeDocument }
+
+// IsSpace — true для space.
+func (t TreeEntity) IsSpace() bool { return t.EntityType == EntityTypeSpace }
+
+// Attachment — вложение документа (или карточки; схема общая).
+type Attachment struct {
+	ID        int       `json:"id"`
+	UID       string    `json:"uid,omitempty"`
+	Name      string    `json:"name"`
+	Size      int64     `json:"size,omitempty"`
+	Type      int       `json:"type,omitempty"` // 1=attachment, см. док
+	URL       string    `json:"url"`
+	SortOrder float64   `json:"sort_order,omitempty"`
+	Created   time.Time `json:"created,omitempty"`
+	Updated   time.Time `json:"updated,omitempty"`
 }
 
 // IsSpaceLevel — true, если документ привязан к пространству, а не к карточке.
@@ -297,4 +342,188 @@ func (c *Client) PatchDocument(ctx context.Context, id int, p PatchPayload) (*Do
 		return nil, err
 	}
 	return &d, nil
+}
+
+// ---------- Tree entities (папки и документы) ----------
+
+// pathTreeEntities — GET /api/latest/tree-entities (сверяется с докой).
+const pathTreeEntities = "/tree-entities"
+
+// ListTreeEntities — одна страница сущностей. Если parentUID == "" — верхний уровень.
+// limit max 500 (ограничение Kaiten API).
+func (c *Client) ListTreeEntities(ctx context.Context, parentUID string, limit, offset int) ([]TreeEntity, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 500
+	}
+	u := fmt.Sprintf("%s?limit=%d&offset=%d", pathTreeEntities, limit, offset)
+	if parentUID != "" {
+		u += "&parent_entity_uid=" + parentUID
+	}
+	body, err := c.do(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	var list []TreeEntity
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+// ListTreeChildrenAll — все прямые потомки parentUID (все страницы).
+func (c *Client) ListTreeChildrenAll(ctx context.Context, parentUID string) ([]TreeEntity, error) {
+	var out []TreeEntity
+	const pageSize = 500
+	for offset := 0; ; offset += pageSize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		page, err := c.ListTreeEntities(ctx, parentUID, pageSize, offset)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page...)
+		if len(page) < pageSize {
+			break
+		}
+	}
+	return out, nil
+}
+
+// WalkTree — рекурсивный DFS-обход дерева от rootUID.
+// Собирает все document_group (папки) и document, включая саму root-сущность в visited.
+// archived элементы пропускаются.
+func (c *Client) WalkTree(ctx context.Context, rootUID string) ([]TreeEntity, error) {
+	visited := map[string]bool{}
+	var out []TreeEntity
+	var walk func(parentUID string) error
+	walk = func(parentUID string) error {
+		children, err := c.ListTreeChildrenAll(ctx, parentUID)
+		if err != nil {
+			return err
+		}
+		for _, ch := range children {
+			if ch.Archived {
+				continue
+			}
+			if visited[ch.UID] {
+				continue // защита от циклов
+			}
+			visited[ch.UID] = true
+			out = append(out, ch)
+			// Рекурсия только в контейнеры: space и document_group.
+			if ch.IsFolder() || ch.IsSpace() {
+				if err := walk(ch.UID); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := walk(rootUID); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ---------- Attachments ----------
+//
+// В публичной документации Kaiten явно расписаны вложения для карточек
+// (PUT /cards/{id}/files). Для документов схема аналогичная:
+// GET /documents/{id}/files — список, PUT /documents/{id}/files — загрузка.
+// Если в вашем инстансе эндпоинты иные — скорректируйте константы ниже.
+
+const (
+	DocAttachmentsList  = "/documents/%d/files"
+	DocAttachmentUpload = "/documents/%d/files"
+	DocAttachmentDelete = "/documents/%d/files/%d"
+)
+
+// ListDocumentAttachments — все вложения документа.
+func (c *Client) ListDocumentAttachments(ctx context.Context, docID int) ([]Attachment, error) {
+	body, err := c.do(ctx, http.MethodGet, fmt.Sprintf(DocAttachmentsList, docID), nil)
+	if err != nil {
+		return nil, err
+	}
+	var list []Attachment
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+// DownloadAttachment — скачивает файл по Attachment.URL в io.Writer.
+// Использует тот же HTTP-клиент и Bearer-токен (для private-file URLs).
+// Rate-limit тоже уважаем.
+func (c *Client) DownloadAttachment(ctx context.Context, urlStr string, w io.Writer) (int64, error) {
+	if err := c.limiter.Wait(ctx); err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		return 0, fmt.Errorf("download %s: %d", c.redact(urlStr), resp.StatusCode)
+	}
+	// Против OOM: лимит размера файла.
+	n, err := io.Copy(w, io.LimitReader(resp.Body, MaxAttachmentSize))
+	return n, err
+}
+
+// MaxAttachmentSize — потолок на размер вложения (защита от больших файлов).
+const MaxAttachmentSize int64 = 256 << 20 // 256 MB
+
+// UploadDocumentAttachment — заливает файл в документ через multipart/form-data.
+// Имя поля формы — "file" (совпадает с attach-to-card).
+func (c *Client) UploadDocumentAttachment(ctx context.Context, docID int, name string, content io.Reader) (*Attachment, error) {
+	if err := c.limiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	part, err := mw.CreateFormFile("file", name)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(part, content); err != nil {
+		return nil, err
+	}
+	if err := mw.Close(); err != nil {
+		return nil, err
+	}
+	url := c.BaseURL + "/api/latest" + fmt.Sprintf(DocAttachmentUpload, docID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, &buf)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, MaxResponseSize))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("upload %s: %d %s", fmt.Sprintf(DocAttachmentUpload, docID), resp.StatusCode, c.redact(string(respBody)))
+	}
+	var a Attachment
+	if err := json.Unmarshal(respBody, &a); err != nil {
+		return nil, fmt.Errorf("parse upload response: %w", err)
+	}
+	return &a, nil
+}
+
+// DeleteDocumentAttachment — удаляет вложение документа.
+func (c *Client) DeleteDocumentAttachment(ctx context.Context, docID, fileID int) error {
+	_, err := c.do(ctx, http.MethodDelete, fmt.Sprintf(DocAttachmentDelete, docID, fileID), nil)
+	return err
 }

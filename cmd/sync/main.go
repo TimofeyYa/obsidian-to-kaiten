@@ -125,7 +125,7 @@ func run(flags config.Flags, extra extraFlags) int {
 		cfg = &config.Config{
 			BaseURL:  res.BaseURL,
 			Token:    res.Token,
-			SpaceID:  res.SpaceID,
+			RootUID:  res.RootUID,
 			VaultDir: vault,
 		}
 		saveRes, serr := config.Save(flags.ConfigPath, cfg)
@@ -189,8 +189,8 @@ func doSync(ctx context.Context, cfg *config.Config, flags config.Flags, logger 
 		Logger:  logger,
 		DryRun:  flags.DryRun,
 	}
-	logger.Info("старт синка", "vault", cfg.VaultDir, "space_id", cfg.SpaceID, "dry_run", flags.DryRun)
-	rep, err := eng.Run(ctx, cfg.SpaceID)
+	logger.Info("старт синка", "vault", cfg.VaultDir, "root_uid", cfg.RootUID, "dry_run", flags.DryRun)
+	rep, err := eng.Run(ctx, cfg.RootUID)
 	if err != nil {
 		logger.Error("синк завершился с ошибкой", "err", err)
 		fmt.Fprintln(os.Stderr, "синк завершился с ошибкой:", err)

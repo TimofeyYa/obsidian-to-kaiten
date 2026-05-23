@@ -25,7 +25,9 @@ type State struct {
 	LastSync    time.Time           `json:"last_sync"`
 	LastSuccess time.Time           `json:"last_success,omitempty"`
 	LastError   string              `json:"last_error,omitempty"`
-	SpaceID     int                 `json:"space_id"`
+	RootUID     string              `json:"root_uid,omitempty"`
+	// SpaceID — legacy-поле для обратной совместимости со старыми state.json.
+	SpaceID int `json:"space_id,omitempty"`
 }
 
 // StatePath — путь к state.json внутри vault.

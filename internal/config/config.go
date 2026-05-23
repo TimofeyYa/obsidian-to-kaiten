@@ -29,10 +29,15 @@ type Flags struct {
 }
 
 // Config — то, что сериализуется в YAML.
+//
+// RootUID — UID корневой сущности Kaiten (пространство или папка),
+// от которой ведётся рекурсивная синхронизация.
 type Config struct {
 	BaseURL  string `yaml:"base_url"`
 	VaultDir string `yaml:"vault_dir"`
-	SpaceID  int    `yaml:"space_id"`
+	RootUID  string `yaml:"root_uid"`
+	// SpaceID сохранён для обратной совместимости со старыми конфигами; новые конфиги его не используют.
+	SpaceID int `yaml:"space_id,omitempty"`
 	// Token хранится в файле только если keyring недоступен.
 	Token string `yaml:"token,omitempty"`
 }
@@ -137,6 +142,9 @@ func (c *Config) Validate() error {
 	}
 	if c.VaultDir == "" {
 		return errors.New("vault_dir пуст")
+	}
+	if c.RootUID == "" {
+		return errors.New("root_uid пуст (выберите папку/пространство в TUI)")
 	}
 	return nil
 }

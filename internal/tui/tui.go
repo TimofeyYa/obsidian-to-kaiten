@@ -1,5 +1,5 @@
 // Package tui — экраны Bubble Tea для интерактивного режима.
-// Три этапа: ввод URL+токена → выбор пространства → прогресс синка.
+// Три этапа: ввод URL+токена → навигация по папкам Kaiten → подтверждение.
 package tui
 
 import (
@@ -20,7 +20,7 @@ import (
 type Result struct {
 	BaseURL string
 	Token   string
-	SpaceID int
+	RootUID string // UID выбранной папки/пространства (root для рекурсивного синка)
 	Aborted bool
 }
 
@@ -33,13 +33,13 @@ var (
 	hintStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#888"))
 )
 
-// ---------- Stage 1: вход (URL + Token) ----------
+// ---------- Этапы ----------
 
 type stage int
 
 const (
 	stageLogin stage = iota
-	stageSpacePick
+	stageFolderPick
 	stageDone
 )
 
@@ -52,10 +52,26 @@ type loginModel struct {
 	user     *kaiten.User
 }
 
+// folderModel — экран навигации по дереву Kaiten.
+// Хранит стек уровней (breadcrumbs) и сообщения от backend.
+type folderModel struct {
+	client  *kaiten.Client
+	list    list.Model
+	loading bool
+	loadErr string
+	spinner spinner.Model
+	stack   []breadcrumb // путь от корня до текущего уровня
+}
+
+type breadcrumb struct {
+	UID   string // "" — самый верх (все spaces)
+	Title string
+}
+
 type model struct {
 	stage  stage
 	login  loginModel
-	picker list.Model
+	folder folderModel
 	result Result
 }
 
@@ -91,26 +107,70 @@ func (m *model) Init() tea.Cmd { return tea.Batch(textinput.Blink, m.login.spinn
 
 // ---------- Сообщения ----------
 
-type checkOKMsg struct {
+type loginOKMsg struct {
 	user   *kaiten.User
-	spaces []kaiten.Space
+	client *kaiten.Client
 }
-type checkErrMsg struct{ err string }
+type loginErrMsg struct{ err string }
 
-// checkCredentials — async задача для проверки токена.
-func checkCredentials(baseURL, token string) tea.Cmd {
+type childrenOKMsg struct {
+	entries []list.Item
+}
+type childrenErrMsg struct{ err string }
+
+// checkLogin — async проверка токена + создание клиента.
+func checkLogin(baseURL, token string) tea.Cmd {
 	return func() tea.Msg {
 		c := kaiten.New(baseURL, token)
 		ctx := context.Background()
 		u, err := c.GetCurrentUser(ctx)
 		if err != nil {
-			return checkErrMsg{err: err.Error()}
+			return loginErrMsg{err: err.Error()}
 		}
-		sps, err := c.ListSpaces(ctx)
+		return loginOKMsg{user: u, client: c}
+	}
+}
+
+// loadChildren — подгружает прямых потомков для текущего уровня.
+// Для верхнего уровня (uid == "") — список spaces.
+func loadChildren(c *kaiten.Client, parentUID string) tea.Cmd {
+	return func() tea.Msg {
+		ctx := context.Background()
+		var items []list.Item
+		if parentUID == "" {
+			// Верхний уровень: показываем пространства через /spaces (быстрее, чем tree-entities root).
+			spaces, err := c.ListSpaces(ctx)
+			if err != nil {
+				return childrenErrMsg{err: "spaces: " + err.Error()}
+			}
+			for _, s := range spaces {
+				items = append(items, treeItem{
+					uid:        s.UID,
+					title:      s.Title,
+					entityType: kaiten.EntityTypeSpace,
+				})
+			}
+			return childrenOKMsg{entries: items}
+		}
+		children, err := c.ListTreeChildrenAll(ctx, parentUID)
 		if err != nil {
-			return checkErrMsg{err: "spaces: " + err.Error()}
+			return childrenErrMsg{err: err.Error()}
 		}
-		return checkOKMsg{user: u, spaces: sps}
+		for _, ch := range children {
+			// Показываем только spaces, folders и documents (без archived).
+			if ch.Archived {
+				continue
+			}
+			if !ch.IsSpace() && !ch.IsFolder() && !ch.IsDocument() {
+				continue
+			}
+			items = append(items, treeItem{
+				uid:        ch.UID,
+				title:      ch.Title,
+				entityType: ch.EntityType,
+			})
+		}
+		return childrenOKMsg{entries: items}
 	}
 }
 
@@ -120,8 +180,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.stage {
 	case stageLogin:
 		return m.updateLogin(msg)
-	case stageSpacePick:
-		return m.updateSpacePick(msg)
+	case stageFolderPick:
+		return m.updateFolderPick(msg)
 	}
 	return m, tea.Quit
 }
@@ -157,33 +217,38 @@ func (m *model) updateLogin(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.login.err = ""
 				m.login.checking = true
-				cmds = append(cmds, checkCredentials(url, tok), m.login.spinner.Tick)
+				cmds = append(cmds, checkLogin(url, tok), m.login.spinner.Tick)
 			}
 		}
 	case spinner.TickMsg:
 		var c tea.Cmd
 		m.login.spinner, c = m.login.spinner.Update(msg)
-		if m.login.checking {
+		if m.login.checking || m.folder.loading {
 			cmds = append(cmds, c)
 		}
-	case checkOKMsg:
+	case loginOKMsg:
 		m.login.checking = false
 		m.login.user = msg.user
 		m.result.BaseURL = strings.TrimRight(m.login.inputs[0].Value(), "/")
 		m.result.Token = m.login.inputs[1].Value()
-		// Готовим list для выбора пространства.
-		items := make([]list.Item, 0, len(msg.spaces))
-		for _, s := range msg.spaces {
-			items = append(items, spaceItem{id: s.ID, title: s.Title})
-		}
-		del := list.NewDefaultDelegate()
-		l := list.New(items, del, 70, 18)
-		l.Title = "Выберите корневое пространство Kaiten"
+
+		// Переход к экрану выбора папки. Подгружаем верхний уровень.
+		delegate := list.NewDefaultDelegate()
+		l := list.New(nil, delegate, 70, 18)
+		l.Title = "Выберите папку для синхронизации"
 		l.SetShowStatusBar(false)
-		m.picker = l
-		m.stage = stageSpacePick
-		return m, nil
-	case checkErrMsg:
+		m.folder = folderModel{
+			client:  msg.client,
+			list:    l,
+			loading: true,
+			spinner: spinner.New(),
+			stack:   []breadcrumb{{UID: "", Title: "Все пространства"}},
+		}
+		m.folder.spinner.Spinner = spinner.Dot
+		m.stage = stageFolderPick
+		cmds = append(cmds, loadChildren(msg.client, ""), m.folder.spinner.Tick)
+		return m, tea.Batch(cmds...)
+	case loginErrMsg:
 		m.login.checking = false
 		m.login.err = msg.err
 		return m, nil
@@ -197,26 +262,63 @@ func (m *model) updateLogin(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m *model) updateSpacePick(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) updateFolderPick(msg tea.Msg) (tea.Model, tea.Cmd) {
+	cmds := make([]tea.Cmd, 0, 4)
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			m.result.Aborted = true
 			return m, tea.Quit
-		case "enter":
-			if it, ok := m.picker.SelectedItem().(spaceItem); ok {
-				m.result.SpaceID = it.id
-				m.stage = stageDone
-				return m, tea.Quit
+		case "backspace", "left":
+			// Подняться на уровень выше.
+			if len(m.folder.stack) > 1 {
+				m.folder.stack = m.folder.stack[:len(m.folder.stack)-1]
+				parent := m.folder.stack[len(m.folder.stack)-1].UID
+				m.folder.loading = true
+				m.folder.loadErr = ""
+				cmds = append(cmds, loadChildren(m.folder.client, parent))
 			}
+		case "enter":
+			// Зайти внутрь space/folder, либо ничего для document.
+			if it, ok := m.folder.list.SelectedItem().(treeItem); ok {
+				if it.entityType == kaiten.EntityTypeSpace || it.entityType == kaiten.EntityTypeDocumentGroup {
+					m.folder.stack = append(m.folder.stack, breadcrumb{UID: it.uid, Title: it.title})
+					m.folder.loading = true
+					m.folder.loadErr = ""
+					cmds = append(cmds, loadChildren(m.folder.client, it.uid))
+				}
+			}
+		case " ", "s":
+			// Выбрать текущий уровень для синхронизации.
+			if len(m.folder.stack) <= 1 {
+				m.folder.loadErr = "выберите папку или пространство (нельзя синхронизировать корень)"
+				return m, nil
+			}
+			cur := m.folder.stack[len(m.folder.stack)-1]
+			m.result.RootUID = cur.UID
+			m.stage = stageDone
+			return m, tea.Quit
 		}
 	case tea.WindowSizeMsg:
-		m.picker.SetSize(msg.Width-4, msg.Height-6)
+		m.folder.list.SetSize(msg.Width-4, msg.Height-8)
+	case childrenOKMsg:
+		m.folder.loading = false
+		m.folder.list.SetItems(msg.entries)
+	case childrenErrMsg:
+		m.folder.loading = false
+		m.folder.loadErr = msg.err
+	case spinner.TickMsg:
+		var c tea.Cmd
+		m.folder.spinner, c = m.folder.spinner.Update(msg)
+		if m.folder.loading {
+			cmds = append(cmds, c)
+		}
 	}
 	var c tea.Cmd
-	m.picker, c = m.picker.Update(msg)
-	return m, c
+	m.folder.list, c = m.folder.list.Update(msg)
+	cmds = append(cmds, c)
+	return m, tea.Batch(cmds...)
 }
 
 // ---------- View ----------
@@ -225,8 +327,8 @@ func (m *model) View() string {
 	switch m.stage {
 	case stageLogin:
 		return m.viewLogin()
-	case stageSpacePick:
-		return "\n" + m.picker.View() + "\n" + hintStyle.Render("enter — выбрать, esc — выход")
+	case stageFolderPick:
+		return m.viewFolderPick()
 	}
 	return ""
 }
@@ -252,19 +354,63 @@ func (m *model) viewLogin() string {
 	return b.String()
 }
 
+func (m *model) viewFolderPick() string {
+	var b strings.Builder
+	// Breadcrumbs.
+	crumbs := make([]string, 0, len(m.folder.stack))
+	for _, c := range m.folder.stack {
+		crumbs = append(crumbs, c.Title)
+	}
+	b.WriteString(titleStyle.Render("📂 " + strings.Join(crumbs, " / ")))
+	b.WriteString("\n")
+	if m.folder.loading {
+		b.WriteString(m.folder.spinner.View() + " загрузка…\n")
+	}
+	if m.folder.loadErr != "" {
+		b.WriteString(errStyle.Render("ошибка: "+m.folder.loadErr) + "\n")
+	}
+	b.WriteString(m.folder.list.View())
+	b.WriteString("\n")
+	b.WriteString(hintStyle.Render("enter — войти в папку/пространство, space или s — выбрать ТЕКУЩИЙ уровень для синхронизации, ← / backspace — назад, esc — выход"))
+	return b.String()
+}
+
 // Result возвращает результат после Quit.
 func (m *model) Result() Result { return m.result }
 
 // ---------- list.Item ----------
 
-type spaceItem struct {
-	id    int
-	title string
+// treeItem — элемент списка: space / folder / document с UID и типом.
+type treeItem struct {
+	uid        string
+	title      string
+	entityType string
 }
 
-func (s spaceItem) Title() string       { return s.title }
-func (s spaceItem) Description() string { return fmt.Sprintf("id=%d", s.id) }
-func (s spaceItem) FilterValue() string { return s.title }
+func (t treeItem) Title() string {
+	icon := "•"
+	switch t.entityType {
+	case kaiten.EntityTypeSpace:
+		icon = "🌐"
+	case kaiten.EntityTypeDocumentGroup:
+		icon = "📁"
+	case kaiten.EntityTypeDocument:
+		icon = "📄"
+	}
+	return icon + " " + t.title
+}
+func (t treeItem) Description() string {
+	switch t.entityType {
+	case kaiten.EntityTypeSpace:
+		return "пространство"
+	case kaiten.EntityTypeDocumentGroup:
+		return "папка"
+	case kaiten.EntityTypeDocument:
+		return "документ"
+	}
+	return t.entityType
+}
+func (t treeItem) FilterValue() string { return t.title }
 
 // Run запускает TUI и возвращает Result. Если пользователь отменил — Result.Aborted = true.
 func Run(initialURL string) (Result, error) {
