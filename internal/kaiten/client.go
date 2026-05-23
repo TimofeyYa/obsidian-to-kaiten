@@ -517,6 +517,9 @@ func (c *Client) listTreeTopLevel(ctx context.Context) ([]TreeEntity, error) {
 // WalkTree — рекурсивный DFS-обход дерева от rootUID.
 // Собирает все document_group (папки) и document, включая саму root-сущность в visited.
 // archived элементы пропускаются.
+//
+// FALLBACK: если tree-entities возвращает пусто (на некоторых инстансах вложенные
+// документы не попадают в tree-entities), пробуем
 func (c *Client) WalkTree(ctx context.Context, rootUID string) ([]TreeEntity, error) {
 	visited := map[string]bool{}
 	var out []TreeEntity
@@ -525,6 +528,23 @@ func (c *Client) WalkTree(ctx context.Context, rootUID string) ([]TreeEntity, er
 		children, err := c.ListTreeChildrenAll(ctx, parentUID)
 		if err != nil {
 			return err
+		}
+		// FALLBACK: если tree-entities пуст для папки, пробуем получить документы
+		// через GET /documents?parent_entity_uid=… (реальный эндпоинт Kaiten).
+		if len(children) == 0 && parentUID != "" {
+			docs, derr := c.ListDocumentsByParent(ctx, parentUID)
+			if derr == nil {
+				for _, d := range docs {
+					p := parentUID
+					children = append(children, TreeEntity{
+						UID:             d.UID,
+						ID:              d.ID,
+						Title:           d.Title,
+						EntityType:      EntityTypeDocument,
+						ParentEntityUID: &p,
+					})
+				}
+			}
 		}
 		for _, ch := range children {
 			if ch.Archived {
@@ -548,6 +568,34 @@ func (c *Client) WalkTree(ctx context.Context, rootUID string) ([]TreeEntity, er
 		return nil, err
 	}
 	return out, nil
+}
+
+// ListDocumentsByParent — GET /documents?parent_entity_uid=<UID>.
+// Этот эндпоинт явно документирован Kaiten (см. /documents/retrieve-list-of-documents)
+// и возвращает все документы внутри папки/пространства по UID. Используется
+// как fallback, когда tree-entities не показывает документы внутри document_group.
+func (c *Client) ListDocumentsByParent(ctx context.Context, parentUID string) ([]Document, error) {
+	var all []Document
+	const pageSize = 500
+	for offset := 0; ; offset += pageSize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		u := fmt.Sprintf("/documents?limit=%d&offset=%d&parent_entity_uid=%s", pageSize, offset, parentUID)
+		body, err := c.do(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		var page []Document
+		if err := json.Unmarshal(body, &page); err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if len(page) < pageSize {
+			break
+		}
+	}
+	return all, nil
 }
 
 // ---------- Attachments ----------

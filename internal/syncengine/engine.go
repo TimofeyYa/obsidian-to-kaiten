@@ -97,7 +97,22 @@ func (e *Engine) Run(ctx context.Context, rootUID string) (rep Report, runErr er
 	if err != nil {
 		return rep, fmt.Errorf("обход дерева Kaiten: %w", err)
 	}
-	e.Logger.Info("дерево Kaiten получено", "root", rootUID, "entities", len(entities))
+	docCount, folderCount := 0, 0
+	for _, en := range entities {
+		switch {
+		case en.IsDocument():
+			docCount++
+		case en.IsFolder():
+			folderCount++
+		}
+	}
+	e.Logger.Info("дерево Kaiten получено",
+		"root", rootUID, "entities", len(entities),
+		"documents", docCount, "folders", folderCount)
+	if len(entities) == 0 && !e.CreateRemote {
+		e.Logger.Warn("папка Kaiten пуста. Если в vault есть локальные .md и вы хотите " +
+			"вылить их в Kaiten — добавьте флаг --create-remote")
+	}
 
 	// 2. Строим карту UID→path для папок и собираем документы.
 	folderPath := buildFolderPaths(rootUID, entities)

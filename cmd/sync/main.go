@@ -43,22 +43,30 @@ const (
 
 // extraFlags содержит флаги сверх базовых config.Flags.
 type extraFlags struct {
-	Timeout time.Duration
+	Timeout            time.Duration
+	CreateRemote       bool
+	DeleteOrphans      bool
+	DeleteLocalOrphans bool
 }
 
 func main() {
-	// Парсим базовые флаги config.ParseFlags + наш собственный --timeout.
-	// Чтобы не ломать существующий API ParseFlags, регистрируем --timeout
-	// после стандартных, до parse.
 	var extra extraFlags
 	flag.DurationVar(&extra.Timeout, "timeout", 10*time.Minute,
 		"жёсткий таймаут выполнения одного прохода синка (защита от подвисших cron-запусков)")
+	flag.BoolVar(&extra.CreateRemote, "create-remote", false,
+		"создавать в Kaiten новые документы, которые вы создали локально в Obsidian")
+	flag.BoolVar(&extra.DeleteOrphans, "delete-orphans", false,
+		"удалять в Kaiten документы, исчезнувшие из vault (ОПАСНО: проверьте --dry-run сначала)")
+	flag.BoolVar(&extra.DeleteLocalOrphans, "delete-local-orphans", false,
+		"удалять локальные .md для документов, удалённых в Kaiten")
 	flags := config.ParseFlags() // вызывает flag.Parse внутри
 	code := run(flags, extra)
 	os.Exit(code)
 }
 
 // run возвращает exit code.
+//
+//nolint:funlen // это оркестратор — разбивка ухудшит читаемость
 func run(flags config.Flags, extra extraFlags) int {
 	// Сигналы (SIGINT/SIGTERM) + жёсткий timeout (R-16).
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -85,7 +93,7 @@ func run(flags config.Flags, extra extraFlags) int {
 			fmt.Fprintln(os.Stderr, "невалидный конфиг:", err)
 			return exitFatal
 		}
-		return doSync(ctx, cfg, flags, logging.SetupSilent(cfg.VaultDir, flags.Verbose))
+		return doSync(ctx, cfg, flags, extra, logging.SetupSilent(cfg.VaultDir, flags.Verbose))
 	}
 
 	// Интерактивный режим: если конфига нет либо vault меняется — гоняем TUI.
@@ -147,10 +155,10 @@ func run(flags config.Flags, extra extraFlags) int {
 	}
 
 	logger := logging.Setup(cfg.VaultDir, flags.Verbose)
-	return doSync(ctx, cfg, flags, logger)
+	return doSync(ctx, cfg, flags, extra, logger)
 }
 
-func doSync(ctx context.Context, cfg *config.Config, flags config.Flags, logger *slog.Logger) int {
+func doSync(ctx context.Context, cfg *config.Config, flags config.Flags, extra extraFlags, logger *slog.Logger) int {
 	// Preflight: проверяем доступность vault на запись (риск R-10).
 	if err := syncengine.Preflight(cfg.VaultDir); err != nil {
 		logger.Error("preflight failed", "err", err)
@@ -182,12 +190,16 @@ func doSync(ctx context.Context, cfg *config.Config, flags config.Flags, logger 
 
 	client := kaiten.New(cfg.BaseURL, cfg.Token)
 	eng := &syncengine.Engine{
-		Vault:   cfg.VaultDir,
-		BaseURL: cfg.BaseURL,
-		Client:  client,
-		State:   state,
-		Logger:  logger,
-		DryRun:  flags.DryRun,
+		Vault:              cfg.VaultDir,
+		BaseURL:            cfg.BaseURL,
+		RootUID:            cfg.RootUID,
+		Client:             client,
+		State:              state,
+		Logger:             logger,
+		DryRun:             flags.DryRun,
+		CreateRemote:       extra.CreateRemote,
+		DeleteOrphans:      extra.DeleteOrphans,
+		DeleteLocalOrphans: extra.DeleteLocalOrphans,
 	}
 	logger.Info("старт синка", "vault", cfg.VaultDir, "root_uid", cfg.RootUID, "dry_run", flags.DryRun)
 	rep, err := eng.Run(ctx, cfg.RootUID)
