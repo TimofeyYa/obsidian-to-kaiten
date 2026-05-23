@@ -174,13 +174,17 @@ type User struct {
 }
 
 // Space — пространство Kaiten.
+//
+// Поле ParentEntityUID в API Kaiten возвращается строкой (UUID-подобный идентификатор),
+// а не числом. Неправильный тип раньше приводил к ошибке парсинга:
+// "json: cannot unmarshal string into Go struct field Space.parent_entity_uid of type int".
 type Space struct {
-	ID       int     `json:"id"`
-	Title    string  `json:"title"`
-	UID      string  `json:"uid,omitempty"`
-	ParentID *int    `json:"parent_entity_uid,omitempty"`
-	Path     string  `json:"path,omitempty"`
-	Entities []Space `json:"entities,omitempty"`
+	ID              int     `json:"id"`
+	Title           string  `json:"title"`
+	UID             string  `json:"uid,omitempty"`
+	ParentEntityUID *string `json:"parent_entity_uid,omitempty"`
+	Path            string  `json:"path,omitempty"`
+	Entities        []Space `json:"entities,omitempty"`
 }
 
 // Document — документ уровня пространства.

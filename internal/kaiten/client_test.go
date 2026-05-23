@@ -192,3 +192,31 @@ func TestPatchDocument_SendsBody(t *testing.T) {
 		t.Errorf("тело запроса некорректно: %s", gotBody)
 	}
 }
+
+// Регрессия: parent_entity_uid в реальном API Kaiten — строка, не число.
+// Старый тип *int падал с "cannot unmarshal string into Go struct field ... of type int".
+func TestListSpaces_ParsesStringParentEntityUID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[
+			{"id":1,"title":"Root","uid":"abc-123","parent_entity_uid":null},
+			{"id":2,"title":"Child","uid":"def-456","parent_entity_uid":"abc-123"}
+		]`))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "tok")
+	c.SetRateLimit(1000)
+	spaces, err := c.ListSpaces(context.Background())
+	if err != nil {
+		t.Fatalf("парсинг упал: %v", err)
+	}
+	if len(spaces) != 2 {
+		t.Fatalf("ожидалось 2 пространства, получено %d", len(spaces))
+	}
+	if spaces[1].ParentEntityUID == nil || *spaces[1].ParentEntityUID != "abc-123" {
+		t.Errorf("parent_entity_uid распарсен некорректно: %+v", spaces[1].ParentEntityUID)
+	}
+	if spaces[0].ParentEntityUID != nil {
+		t.Errorf("null должен дать nil-указатель, получено %v", spaces[0].ParentEntityUID)
+	}
+}
