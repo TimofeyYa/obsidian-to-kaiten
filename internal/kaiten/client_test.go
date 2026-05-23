@@ -2,6 +2,7 @@ package kaiten
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -288,5 +289,45 @@ func TestListAllDocumentGroups(t *testing.T) {
 	}
 	if drafts == nil || !strings.Contains(drafts.FullPath, "Marketing / Docs / Drafts") {
 		t.Errorf("вложенный path неверен: %+v", drafts)
+	}
+}
+
+// Регрессия: POST /documents возвращает id строкой "123", а GET — числом 123.
+// Document.UnmarshalJSON должен переварить оба варианта.
+func TestDocument_UnmarshalJSON_AcceptsStringID(t *testing.T) {
+	// id строкой (POST /documents response style).
+	var d1 Document
+	if err := json.Unmarshal([]byte(`{"id":"42","title":"X","uid":"u42"}`), &d1); err != nil {
+		t.Fatalf("string id не распарсился: %v", err)
+	}
+	if d1.ID != 42 {
+		t.Errorf("string id → %d, ожидалось 42", d1.ID)
+	}
+	if d1.UID != "u42" {
+		t.Errorf("uid потерян: %q", d1.UID)
+	}
+
+	// id числом (GET /documents).
+	var d2 Document
+	if err := json.Unmarshal([]byte(`{"id":42,"title":"X"}`), &d2); err != nil {
+		t.Fatalf("int id не распарсился: %v", err)
+	}
+	if d2.ID != 42 {
+		t.Errorf("int id → %d, ожидалось 42", d2.ID)
+	}
+
+	// id отсутствует — не падаем.
+	var d3 Document
+	if err := json.Unmarshal([]byte(`{"title":"X"}`), &d3); err != nil {
+		t.Fatalf("отсутствующий id ломает парсинг: %v", err)
+	}
+
+	// id строкой, но не число → используем как UID.
+	var d4 Document
+	if err := json.Unmarshal([]byte(`{"id":"abc-uuid","title":"X"}`), &d4); err != nil {
+		t.Fatalf("не-числовая строка id ломает парсинг: %v", err)
+	}
+	if d4.UID != "abc-uuid" {
+		t.Errorf("не-числовой id не сохранён как UID: %+v", d4)
 	}
 }

@@ -190,8 +190,12 @@ type Space struct {
 
 // Document — документ уровня пространства.
 // Поле Type принимает значения "html" или "markdown".
+//
+// ОСОБЕННОСТЬ: по доке Kaiten поле id для документов — string, но
+// на практике приходит и integer (например в ListTreeEntities). Поэтому ID храним
+// как int, но принимаем оба варианта через UnmarshalJSON.
 type Document struct {
-	ID       int       `json:"id"`
+	ID       int       `json:"-"`
 	UID      string    `json:"uid,omitempty"`
 	Title    string    `json:"title"`
 	Type     string    `json:"type"`
@@ -201,6 +205,85 @@ type Document struct {
 	ParentID *int      `json:"parent_id,omitempty"`
 	Updated  time.Time `json:"updated"`
 	CardID   *int      `json:"card_id,omitempty"`
+}
+
+// docAlias — технический тип для UnmarshalJSON без бесконечной рекурсии.
+type docAlias struct {
+	ID       json.RawMessage `json:"id"`
+	UID      string          `json:"uid,omitempty"`
+	Title    string          `json:"title"`
+	Type     string          `json:"type"`
+	Content  string          `json:"content"`
+	Path     string          `json:"path,omitempty"`
+	SpaceID  int             `json:"space_id,omitempty"`
+	ParentID *int            `json:"parent_id,omitempty"`
+	Updated  time.Time       `json:"updated"`
+	CardID   *int            `json:"card_id,omitempty"`
+}
+
+// MarshalJSON — выводит ID как number в JSON (нужно только в тестах и для отладки).
+func (d Document) MarshalJSON() ([]byte, error) {
+	type out struct {
+		ID       int       `json:"id"`
+		UID      string    `json:"uid,omitempty"`
+		Title    string    `json:"title"`
+		Type     string    `json:"type"`
+		Content  string    `json:"content"`
+		Path     string    `json:"path,omitempty"`
+		SpaceID  int       `json:"space_id,omitempty"`
+		ParentID *int      `json:"parent_id,omitempty"`
+		Updated  time.Time `json:"updated"`
+		CardID   *int      `json:"card_id,omitempty"`
+	}
+	return json.Marshal(out{
+		ID: d.ID, UID: d.UID, Title: d.Title, Type: d.Type,
+		Content: d.Content, Path: d.Path, SpaceID: d.SpaceID,
+		ParentID: d.ParentID, Updated: d.Updated, CardID: d.CardID,
+	})
+}
+
+// UnmarshalJSON принимает id как string или как number.
+// Это фикс ошибки "cannot unmarshal string into Go struct field Document.id of type int":
+// POST /documents возвращает id строкой (согласно доке), GET /documents — числом.
+func (d *Document) UnmarshalJSON(data []byte) error {
+	var raw docAlias
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	d.UID = raw.UID
+	d.Title = raw.Title
+	d.Type = raw.Type
+	d.Content = raw.Content
+	d.Path = raw.Path
+	d.SpaceID = raw.SpaceID
+	d.ParentID = raw.ParentID
+	d.Updated = raw.Updated
+	d.CardID = raw.CardID
+	if len(raw.ID) == 0 {
+		return nil
+	}
+	// Строковый вариант "123".
+	if raw.ID[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw.ID, &s); err != nil {
+			return err
+		}
+		if s == "" {
+			return nil
+		}
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			// Не числовая строка — используем как UID, ID оставляем 0.
+			if d.UID == "" {
+				d.UID = s
+			}
+			return nil
+		}
+		d.ID = n
+		return nil
+	}
+	// Числовой вариант 123.
+	return json.Unmarshal(raw.ID, &d.ID)
 }
 
 // Типы сущностей в tree-entities.
