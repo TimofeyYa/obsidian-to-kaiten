@@ -506,7 +506,36 @@ type CreatePayload struct {
 	SortOrder       float64 `json:"sort_order"`
 }
 
+// CreateGroupPayload — создание вложенной папки (document_group).
+// Согласно доке Kaiten /tree-entities POST.
+type CreateGroupPayload struct {
+	Title           string  `json:"title"`
+	ParentEntityUID *string `json:"parent_entity_uid,omitempty"`
+	SortOrder       float64 `json:"sort_order"`
+	EntityType      string  `json:"entity_type"` // всегда "document_group"
+}
+
+// CreateDocumentGroup — создаёт новую папку (document_group) внутри родителя.
+// Используется, чтобы отразить файловую иерархию Obsidian в Kaiten.
+func (c *Client) CreateDocumentGroup(ctx context.Context, p CreateGroupPayload) (*TreeEntity, error) {
+	if p.SortOrder == 0 {
+		p.SortOrder = float64(time.Now().UnixNano()) / 1e9
+	}
+	p.EntityType = EntityTypeDocumentGroup
+	body, err := c.do(ctx, http.MethodPost, pathTreeEntities, p)
+	if err != nil {
+		return nil, err
+	}
+	var t TreeEntity
+	if err := json.Unmarshal(body, &t); err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
 // CreateDocument — создаёт новый документ в указанной папке/пространстве.
+// На ряде инстансах Kaiten POST /documents игнорирует поле content в теле запроса
+// (сохраняет только title); реальное тело нужно отправлять отдельным PATCH'ом.
 func (c *Client) CreateDocument(ctx context.Context, p CreatePayload) (*Document, error) {
 	if p.SortOrder == 0 {
 		p.SortOrder = float64(time.Now().Unix()) // иначе Kaiten отклонит (exclusiveMinimum: 0)
@@ -529,9 +558,22 @@ func (c *Client) DeleteDocument(ctx context.Context, idOrUID string) error {
 	return err
 }
 
-// PatchDocument — обновить документ. Возвращает обновлённую версию.
+// PatchDocument — обновить документ по числовому ID. Возвращает обновлённую версию.
 func (c *Client) PatchDocument(ctx context.Context, id int, p PatchPayload) (*Document, error) {
 	body, err := c.do(ctx, http.MethodPatch, fmt.Sprintf(DocPath, id), p)
+	if err != nil {
+		return nil, err
+	}
+	var d Document
+	if err := json.Unmarshal(body, &d); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// PatchDocumentByUID — обновить документ по UID. Основной путь в Kaiten API.
+func (c *Client) PatchDocumentByUID(ctx context.Context, uid string, p PatchPayload) (*Document, error) {
+	body, err := c.do(ctx, http.MethodPatch, "/documents/"+uid, p)
 	if err != nil {
 		return nil, err
 	}

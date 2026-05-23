@@ -261,16 +261,20 @@ func (e *Engine) Run(ctx context.Context, rootUID string) (rep Report, runErr er
 	}
 
 	// 7. Обработка новых «голых» файлов (#5): пользователь создал .md в Obsidian.
+	// Создаём промежуточные папки (document_group) по пути файла в vault.
 	if e.CreateRemote {
 		untracked, uerr := obsidian.WalkUntracked(e.Vault)
 		if uerr != nil {
 			e.Logger.Warn("поиск untracked-файлов", "err", uerr)
 		} else {
+			// Кэш «relative directory path» → UID папки в Kaiten.
+			// Инициализируем из существующего дерева и из state.
+			folderUID := e.buildFolderUIDCache(entities, folderPath)
 			for _, abs := range untracked {
 				if err := ctx.Err(); err != nil {
 					return rep, err
 				}
-				if err := e.createFromUntracked(ctx, abs, &rep); err != nil {
+				if err := e.createFromUntracked(ctx, abs, folderUID, &rep); err != nil {
 					e.Logger.Warn("не удалось создать в Kaiten", "path", abs, "err", err)
 					rep.Errors++
 				}
@@ -287,9 +291,14 @@ func (e *Engine) Run(ctx context.Context, rootUID string) (rep Report, runErr er
 	return rep, nil
 }
 
-// createFromUntracked — работает с .md файлом без kaiten_id: читаем сырой контент,
-// извлекаем title из имени файла, POST в Kaiten, и перезаписываем файл с frontmatter.
-func (e *Engine) createFromUntracked(ctx context.Context, abs string, rep *Report) error {
+// createFromUntracked — работает с .md файлом без kaiten_id.
+//
+// Работает в 3 шага:
+//  1. Обеспечивает иерархию папок (document_group) по пути файла в vault.
+//  2. POST /documents в правильную папку с title.
+//  3. PATCH /documents/{uid} с content — Kaiten при POST часто игнорирует
+//     поле content, реальное тело нужно отправлять отдельным патчем.
+func (e *Engine) createFromUntracked(ctx context.Context, abs string, folderUID map[string]string, rep *Report) error {
 	data, err := os.ReadFile(abs) //nolint:gosec
 	if err != nil {
 		return err
@@ -301,21 +310,36 @@ func (e *Engine) createFromUntracked(ctx context.Context, abs string, rep *Repor
 		return nil
 	}
 	rel, _ := filepath.Rel(e.Vault, abs)
+	rel = filepath.ToSlash(rel)
 	title := strings.TrimSuffix(filepath.Base(rel), ".md")
+	relDir := filepath.ToSlash(filepath.Dir(rel))
+	if relDir == "." {
+		relDir = ""
+	}
+
 	if e.DryRun {
-		e.Logger.Info("would create from untracked", "path", rel, "title", title)
+		e.Logger.Info("would create from untracked", "path", rel, "title", title, "dir", relDir)
 		rep.Created++
 		return nil
 	}
+
+	// 1. Обеспечиваем все промежуточные папки в Kaiten.
+	parentUID, perr := e.ensureFolderHierarchy(ctx, relDir, folderUID)
+	if perr != nil {
+		return fmt.Errorf("ensure folder hierarchy: %w", perr)
+	}
+
 	body := bodyStr
 	if e.resolver != nil {
 		body = e.resolver.ObsidianToKaiten(body)
 	}
+
 	var parent *string
-	if e.RootUID != "" {
-		root := e.RootUID
-		parent = &root
+	if parentUID != "" {
+		parent = &parentUID
 	}
+
+	// 2. Создаём документ (возможно без content — зависит от инстанса).
 	created, cerr := e.Client.CreateDocument(ctx, kaiten.CreatePayload{
 		Title:           title,
 		Content:         body,
@@ -325,24 +349,104 @@ func (e *Engine) createFromUntracked(ctx context.Context, abs string, rep *Repor
 	if cerr != nil {
 		return fmt.Errorf("create from untracked: %w", cerr)
 	}
-	// Пишем frontmatter в локальный файл.
+
+	// 3. PATCH с content — обрабатываем случай, когда POST проигнорировал тело.
+	if created.UID != "" {
+		updated, perr := e.Client.PatchDocumentByUID(ctx, created.UID, kaiten.PatchPayload{
+			Content: body,
+			Type:    "markdown",
+		})
+		if perr != nil {
+			e.Logger.Warn("PATCH content после create не удался — документ создан без тела",
+				"uid", created.UID, "err", perr)
+		} else {
+			created.Content = updated.Content
+			created.Updated = updated.Updated
+		}
+	}
+
+	// 4. Пишем frontmatter в локальный файл.
+	docURL := fmt.Sprintf("%s/documents/%s", strings.TrimRight(e.BaseURL, "/"), created.UID)
+	if created.UID == "" && created.ID != 0 {
+		docURL = fmt.Sprintf("%s/document/%d", strings.TrimRight(e.BaseURL, "/"), created.ID)
+	}
 	fm := obsidian.Frontmatter{
 		KaitenID:  created.ID,
-		KaitenURL: fmt.Sprintf("%s/document/%d", strings.TrimRight(e.BaseURL, "/"), created.ID),
+		KaitenUID: created.UID,
+		KaitenURL: docURL,
 		Updated:   created.Updated,
 	}
 	if err := obsidian.WriteAtomic(abs, fm, bodyStr, false); err != nil {
 		return err
 	}
-	e.State.Documents[strconv.Itoa(created.ID)] = DocState{
-		Path:          filepath.ToSlash(rel),
+	stateKey := created.UID
+	if stateKey == "" {
+		stateKey = strconv.Itoa(created.ID)
+	}
+	e.State.Documents[stateKey] = DocState{
+		Path:          rel,
 		KaitenUpdated: created.Updated,
 		LocalMtime:    created.Updated,
 		ContentHash:   obsidian.HashBody(bodyStr),
 	}
 	rep.Created++
-	e.Logger.Info("created from untracked", "id", created.ID, "path", rel)
+	e.Logger.Info("created from untracked",
+		"uid", created.UID, "id", created.ID, "path", rel, "parent", parentUID)
 	return nil
+}
+
+// buildFolderUIDCache — строит обратный индекс «relative dir path» → «UID папки в Kaiten».
+// Основано на folderPath из buildFolderPaths.
+func (e *Engine) buildFolderUIDCache(entities []kaiten.TreeEntity, folderPath map[string]string) map[string]string {
+	cache := map[string]string{
+		"": e.RootUID, // корень — выбранная пользователем папка
+	}
+	for _, en := range entities {
+		if !en.IsFolder() {
+			continue
+		}
+		p, ok := folderPath[en.UID]
+		if !ok {
+			continue
+		}
+		cache[filepath.ToSlash(p)] = en.UID
+	}
+	return cache
+}
+
+// ensureFolderHierarchy — для заданного relDir (например "Notes/Jira") создаёт
+// недостающие document_group и возвращает UID самой внутренней папки.
+// Кэширует в folderUID, чтобы не создавать повторно.
+func (e *Engine) ensureFolderHierarchy(ctx context.Context, relDir string, folderUID map[string]string) (string, error) {
+	if relDir == "" || relDir == "." {
+		return e.RootUID, nil
+	}
+	if uid, ok := folderUID[relDir]; ok {
+		return uid, nil
+	}
+	// Нужно подняться на уровень выше и создать текущую папку в родителе.
+	parts := strings.Split(relDir, "/")
+	parentPath := strings.Join(parts[:len(parts)-1], "/")
+	parentUID, err := e.ensureFolderHierarchy(ctx, parentPath, folderUID)
+	if err != nil {
+		return "", err
+	}
+	name := parts[len(parts)-1]
+	// Создаём папку в Kaiten.
+	var parentPtr *string
+	if parentUID != "" {
+		parentPtr = &parentUID
+	}
+	created, cerr := e.Client.CreateDocumentGroup(ctx, kaiten.CreateGroupPayload{
+		Title:           name,
+		ParentEntityUID: parentPtr,
+	})
+	if cerr != nil {
+		return "", fmt.Errorf("create folder %q: %w", relDir, cerr)
+	}
+	folderUID[relDir] = created.UID
+	e.Logger.Info("created folder in Kaiten", "path", relDir, "uid", created.UID)
+	return created.UID, nil
 }
 
 // buildFolderPaths — для каждой папки/пространства вычисляет относительный путь

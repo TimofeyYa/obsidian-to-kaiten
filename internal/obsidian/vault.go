@@ -19,8 +19,10 @@ import (
 )
 
 // Frontmatter — обязательные поля метаданных в каждом синхронизируемом файле.
+// KaitenUID — основной идентификатор документа в Kaiten API; KaitenID — legacy/int.
 type Frontmatter struct {
 	KaitenID  int       `yaml:"kaiten_id"`
+	KaitenUID string    `yaml:"kaiten_uid,omitempty"`
 	KaitenURL string    `yaml:"kaiten_url"`
 	Updated   time.Time `yaml:"updated"`
 	Type      string    `yaml:"kaiten_type,omitempty"`
@@ -134,7 +136,7 @@ func Walk(vault string) ([]File, error) {
 }
 
 // ReadFile читает .md, парсит frontmatter и заполняет File.
-// Возвращает ошибку, если frontmatter не найден или kaiten_id == 0.
+// Возвращает ошибку, если frontmatter не найден или нет ни kaiten_id, ни kaiten_uid.
 func ReadFile(vault, abs string) (*File, error) {
 	data, err := os.ReadFile(abs)
 	if err != nil {
@@ -144,8 +146,8 @@ func ReadFile(vault, abs string) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if fm.KaitenID == 0 {
-		return nil, fmt.Errorf("kaiten_id отсутствует во frontmatter")
+	if fm.KaitenID == 0 && fm.KaitenUID == "" {
+		return nil, fmt.Errorf("нет kaiten_id/kaiten_uid во frontmatter")
 	}
 	st, _ := os.Stat(abs)
 	rel, _ := filepath.Rel(vault, abs)
