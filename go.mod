@@ -8,6 +8,7 @@ require (
 	github.com/charmbracelet/bubbletea v1.2.4
 	github.com/charmbracelet/lipgloss v1.0.0
 	github.com/gofrs/flock v0.12.1
+	github.com/yuin/goldmark v1.7.1
 	github.com/zalando/go-keyring v0.2.6
 	golang.org/x/time v0.8.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1

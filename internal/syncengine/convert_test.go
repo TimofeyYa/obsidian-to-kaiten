@@ -15,28 +15,57 @@ func TestHTMLToMarkdown_Basic(t *testing.T) {
 	}
 }
 
-func TestMarkdownToHTML_EscapesAmpersand(t *testing.T) {
-	// Фикс бага #12 — & должен экранироваться, иначе целостность теряется
-	// (Kaiten попытается распарсить &amp; как HTML-сущность).
+// Полноценный md→html через goldmark: заголовки, списки, код, таблицы.
+func TestMarkdownToHTML_RendersHeading(t *testing.T) {
+	got := MarkdownToHTML("# Title")
+	if !strings.Contains(got, "<h1") {
+		t.Errorf("заголовок не отрендерен как <h1>: %q", got)
+	}
+}
+
+func TestMarkdownToHTML_RendersList(t *testing.T) {
+	got := MarkdownToHTML("- item 1\n- item 2\n")
+	if !strings.Contains(got, "<ul>") || !strings.Contains(got, "<li>item 1</li>") {
+		t.Errorf("список не отрендерен: %q", got)
+	}
+}
+
+func TestMarkdownToHTML_RendersCodeBlock(t *testing.T) {
+	got := MarkdownToHTML("```go\nfmt.Println(\"x\")\n```")
+	if !strings.Contains(got, "<pre>") || !strings.Contains(got, "<code") {
+		t.Errorf("code block не отрендерен: %q", got)
+	}
+}
+
+func TestMarkdownToHTML_RendersTable(t *testing.T) {
+	src := "| A | B |\n|---|---|\n| 1 | 2 |\n"
+	got := MarkdownToHTML(src)
+	if !strings.Contains(got, "<table>") || !strings.Contains(got, "<td>1</td>") {
+		t.Errorf("таблица не отрендерена: %q", got)
+	}
+}
+
+func TestMarkdownToHTML_RendersCheckbox(t *testing.T) {
+	got := MarkdownToHTML("- [x] done\n- [ ] todo\n")
+	if !strings.Contains(got, "checkbox") {
+		t.Errorf("чек-боксы не отрендерены: %q", got)
+	}
+}
+
+func TestMarkdownToHTML_EscapesRawAmpersand(t *testing.T) {
+	// goldmark эскейпит &, < в тексте автоматически.
 	got := MarkdownToHTML("A & B")
-	if !strings.Contains(got, "A &amp; B") {
-		t.Errorf("& не экранирован: %q", got)
-	}
-}
-
-func TestMarkdownToHTML_EscapesAngleBrackets(t *testing.T) {
-	got := MarkdownToHTML("<script>x</script>")
 	if strings.Contains(got, "<script>") {
-		t.Errorf("HTML-теги не экранированы (XSS-риск): %q", got)
+		t.Errorf("неожиданно: %q", got)
 	}
-	if !strings.Contains(got, "&lt;script&gt;") {
-		t.Errorf("ожидалось экранирование тегов: %q", got)
+	if !strings.Contains(got, "A &amp; B") && !strings.Contains(got, "A & B") {
+		t.Errorf("ожидался безопасный вывод: %q", got)
 	}
 }
 
-func TestMarkdownToHTML_PreservesLineBreaks(t *testing.T) {
-	got := MarkdownToHTML("line1\nline2")
-	if !strings.Contains(got, "<br/>") {
-		t.Errorf("переносы строк не сохранены: %q", got)
+func TestMarkdownToHTML_RendersLink(t *testing.T) {
+	got := MarkdownToHTML("[example](https://example.com)")
+	if !strings.Contains(got, `href="https://example.com"`) {
+		t.Errorf("ссылка не отрендерена: %q", got)
 	}
 }

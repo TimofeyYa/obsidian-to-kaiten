@@ -48,6 +48,10 @@ type Engine struct {
 	// docRelHint — релативная директория в vault для текущего документа
 	// (вычисляется из иерархии tree-entities). Передаётся в targetRelPath.
 	docRelHint string
+
+	// resolver и imgHandler — контексты для трансляции ссылок и inline-картинок.
+	resolver   *LinkResolver
+	imgHandler *ImageHandler
 }
 
 // AttachmentsDir — имя подпапки в vault, куда скачиваются вложения Kaiten.
@@ -122,6 +126,16 @@ func (e *Engine) Run(ctx context.Context, rootUID string) (rep Report, runErr er
 
 	// 5. Строим план.
 	decisions := BuildDecisions(full, locals, e.State)
+
+	// 5a. Контексты для трансляции ссылок и inline-картинок.
+	e.resolver = NewLinkResolver(full, locals)
+	e.imgHandler = &ImageHandler{
+		Vault:   e.Vault,
+		BaseURL: e.BaseURL,
+		Client:  e.Client,
+		Logger:  e.Logger,
+		DryRun:  e.DryRun,
+	}
 
 	// 6. Применяем.
 	for _, dec := range decisions {
@@ -250,6 +264,14 @@ func (e *Engine) pullRemote(d Decision, idKey string, rep *Report) error {
 		}
 		body = m
 	}
+	// Скачиваем inline-картинки и переписываем ссылки.
+	if e.imgHandler != nil {
+		body = e.imgHandler.RewriteForObsidian(context.Background(), r.ID, body)
+	}
+	// Переводим ссылки Kaiten в wikilinks Obsidian.
+	if e.resolver != nil {
+		body = e.resolver.KaitenToObsidian(body)
+	}
 
 	relPath := e.targetRelPath(r, d.Local)
 
@@ -296,14 +318,23 @@ func (e *Engine) pullRemote(d Decision, idKey string, rep *Report) error {
 // чтобы следующий синк не увидел расхождение (fix бага #6).
 func (e *Engine) pushLocal(ctx context.Context, d Decision, idKey string, rep *Report) error {
 	l := d.Local
+	body := l.Body
+	// Конвертируем wikilinks [[Title]] обратно в /document/<id>.
+	if e.resolver != nil {
+		body = e.resolver.ObsidianToKaiten(body)
+	}
+	// Загружаем inline-картинки из ![[...]] и переписываем на Kaiten URL.
+	if e.imgHandler != nil {
+		body = e.imgHandler.RewriteForKaiten(ctx, d.KaitenID, body)
+	}
 	payload := kaiten.PatchPayload{
 		Title:   strings.TrimSuffix(filepath.Base(l.RelPath), ".md"),
-		Content: l.Body,
+		Content: body,
 		Type:    "markdown",
 	}
-	// Если оригинал был HTML — конвертируем обратно.
+	// Если оригинал был HTML — рендерим в HTML через goldmark.
 	if d.Remote != nil && strings.EqualFold(d.Remote.Type, "html") {
-		payload.Content = MarkdownToHTML(l.Body)
+		payload.Content = MarkdownToHTML(body)
 		payload.Type = "html"
 	}
 	if e.DryRun {
